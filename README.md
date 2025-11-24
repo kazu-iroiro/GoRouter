@@ -4,6 +4,8 @@
 ```
 go mod init bonding
 go get github.com/songgao/water
+
+go build -o bonding main.go
 ```
 
 #### 1. サーバー側 (IP: x.x.x.x, TUN IP: 10.0.0.1)
