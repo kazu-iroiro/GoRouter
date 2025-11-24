@@ -23,7 +23,8 @@ sudo iptables -t nat -A POSTROUTING -s 10.0.0.0/24 -o eth0 -j MASQUERADE
 #### 2. クライアント側 (TUN IP: 10.0.0.2)
 ```bash
 # プログラム起動 (サーバーへ接続)
-sudo ./bonding -mode client -vip 10.0.0.2/24 -addr x.x.x.x:8080 -lines 2
+#sudo ./bonding -mode client -vip 10.0.0.2/24 -addr x.x.x.x:8080 -lines 2
+sudo ./bonding -mode client -addr x.x.x.x:8080 -lines 2 -ifaces "eth0,wlan0"
 
 # (別ターミナル) 特定の通信をTUN経由にするテスト
 ping 10.0.0.1

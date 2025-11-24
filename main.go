@@ -1,7 +1,7 @@
 package main
 
 import (
-	"bytes"
+	"bufio"
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
@@ -13,506 +13,257 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/big"
 	"net"
 	"os"
-	"os/exec"
-	"strings"
-	"sync"
-	"time"
-
-	"github.com/songgao/water"
 )
 
 // --- 設定・定数 ---
 
 const (
-	ProtocolVersion   = "BOND/3.0-TUN"
-	ChallengeSize     = 32
-	KeepAliveInterval = 10 * time.Second
-	TunReadSize       = 2000 // OSから読み取るパケットの最大サイズ(MTUより少し大きく)
+	ProtocolVersion = "BOND/1.0"
+	ChallengeSize   = 32
 )
 
-// PacketType 定義
-type PacketType int
-
-const (
-	TypeData PacketType = iota
-	TypePing
-	TypePong
-)
-
-// Packet はボンディング回線を流れるデータの単位
+// Packet はネットワークを流れるデータの単位です
 type Packet struct {
-	Type      PacketType
-	SeqID     int64
-	Payload   []byte // 分割されたデータ
-	IsFin     bool   // フラグメンテーションの終了コード (1つのIPパケットの終わり)
-	Timestamp int64
+	SeqID   int64  // 再構成用のシーケンス番号
+	Payload []byte // データ本体
 }
 
-// HandshakeMsg 認証用
+// HandshakeMsg は接続確立時の認証用メッセージです
 type HandshakeMsg struct {
-	PublicKey []byte
-	Signature []byte
+	PublicKey []byte // PEM形式の公開鍵
+	Signature []byte // チャレンジに対する署名
 }
 
-// --- グローバル変数 ---
+// --- グローバル変数（簡易的な鍵管理） ---
+// 実際の運用ではファイルから読み込みますが、サンプル動作のためにオンメモリで生成・保持します
 var (
 	serverPrivKey *rsa.PrivateKey
 	clientPrivKey *rsa.PrivateKey
-	globalSeqID   int64      // 送信用シーケンス番号(スレッドセーフにする必要あり)
-	seqMu         sync.Mutex // SeqID用Mutex
 )
 
 func init() {
-	// 鍵生成 (本来は永続化)
+	// デモ用に起動時に鍵を生成
 	var err error
 	serverPrivKey, err = rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil { log.Fatal(err) }
+	if err != nil {
+		log.Fatal(err)
+	}
 	clientPrivKey, err = rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil { log.Fatal(err) }
+	if err != nil {
+		log.Fatal(err)
+	}
 }
+
+// --- メイン処理 ---
 
 func main() {
 	mode := flag.String("mode", "server", "Mode: server or client")
-	addr := flag.String("addr", "0.0.0.0:8080", "Server listen/connect address")
+	addr := flag.String("addr", "localhost:8080", "Server address")
 	lines := flag.Int("lines", 2, "Number of connection lines (Client mode only)")
-	mtu := flag.Int("mtu", 1300, "Virtual Interface MTU (should be smaller than physical MTU)")
-	fragSize := flag.Int("frag", 1024, "Fragmentation size for splitting packets over lines")
-	vip := flag.String("vip", "10.0.0.1/24", "Virtual IP CIDR for TUN interface")
-	weights := flag.String("weights", "", "Comma separated weights")
 	flag.Parse()
 
-	// TUNインターフェースの作成
-	iface, err := setupTUN(*vip, *mtu)
-	if err != nil {
-		log.Fatalf("Failed to setup TUN: %v", err)
-	}
-	defer iface.Close()
-
 	if *mode == "server" {
-		runServer(iface, *addr, *fragSize)
+		runServer(*addr)
 	} else {
-		runClient(iface, *addr, *lines, *fragSize, *weights)
+		runClient(*addr, *lines)
 	}
 }
 
-// --- TUN Interface Setup ---
+// --- サーバー側実装（再構成・集約） ---
 
-func setupTUN(cidr string, mtu int) (*water.Interface, error) {
-	config := water.Config{
-		DeviceType: water.TUN,
-	}
-	iface, err := water.New(config)
-	if err != nil {
-		return nil, err
-	}
-	log.Printf("Interface %s created", iface.Name())
-
-	// IPアドレスとリンクアップの設定 (Linuxコマンド呼び出し)
-	// ip addr add 10.0.0.1/24 dev tun0
-	cmd := exec.Command("ip", "addr", "add", cidr, "dev", iface.Name())
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("ip addr add failed: %v, out: %s", err, out)
-	}
-
-	// ip link set dev tun0 mtu 1300 up
-	cmd = exec.Command("ip", "link", "set", "dev", iface.Name(), "mtu", fmt.Sprintf("%d", mtu), "up")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("ip link set up failed: %v, out: %s", err, out)
-	}
-
-	return iface, nil
-}
-
-// ==========================================
-// 共通ロジック (Reader/Writer)
-// ==========================================
-
-// ConnectionWrapper は各TCPコネクションを抽象化
-type ConnectionWrapper struct {
-	ID         int
-	Conn       net.Conn
-	Enc        *gob.Encoder
-	Mu         sync.Mutex
-	Alive      bool
-	RTT        time.Duration
-	BaseWeight int
-}
-
-// tunToNetworkLoop : TUNからパケットを読み出し -> 分割 -> ネットワークへ送信
-func tunToNetworkLoop(iface *water.Interface, conns []*ConnectionWrapper, fragSize int) {
-	packet := make([]byte, TunReadSize)
-
-	for {
-		n, err := iface.Read(packet)
-		if err != nil {
-			log.Fatalf("TUN read error: %v", err)
-		}
-
-		// OSから受け取った1つのIPパケット (サイズ n)
-		rawData := packet[:n]
-		
-		// フラグメンテーションと送信
-		// 1つのIPパケットを fragSize ごとに分割して送信し、最後に IsFin=true を送る
-		offset := 0
-		for offset < n {
-			end := offset + fragSize
-			isLast := false
-			if end >= n {
-				end = n
-				isLast = true
-			}
-			
-			chunk := make([]byte, end-offset)
-			copy(chunk, rawData[offset:end])
-
-			seqMu.Lock()
-			currentSeq := globalSeqID
-			globalSeqID++
-			seqMu.Unlock()
-
-			pkt := Packet{
-				Type:    TypeData,
-				SeqID:   currentSeq,
-				Payload: chunk,
-				IsFin:   isLast, // 終了コード: 分割の最後であることを通知
-			}
-
-			sendPacketWeighted(conns, pkt)
-			offset = end
-		}
-	}
-}
-
-// networkToTunLoop : ネットワークからパケット受信 -> 再構成 -> TUNへ書き込み
-func networkToTunLoop(iface *water.Interface, pktChan <-chan Packet) {
-	var nextSeqID int64 = 0
-	buffer := make(map[int64]Packet)
-	
-	// 1つのIPパケットを再構築するための一時バッファ
-	var ipPacketBuffer bytes.Buffer
-	// 再構築中のパケットが連続しているか確認するためのフラグ
-	reassembling := false
-
-	// パケット処理関数
-	processPacket := func(pkt Packet) {
-		if pkt.Type != TypeData { return }
-
-		// データ追記
-		ipPacketBuffer.Write(pkt.Payload)
-		reassembling = true
-
-		// 終了コード(IsFin)を受け取ったら、OSへ書き込む
-		if pkt.IsFin {
-			data := ipPacketBuffer.Bytes()
-			// log.Printf("[TUN Write] Reassembled IP Packet Size: %d", len(data))
-			
-			_, err := iface.Write(data)
-			if err != nil {
-				log.Printf("TUN write error: %v", err)
-			}
-			
-			// バッファリセット
-			ipPacketBuffer.Reset()
-			reassembling = false
-		}
-	}
-
-	for pkt := range pktChan {
-		// --- 簡易的なセッションリセット検出 ---
-		// 相手が再起動してSeqID 0を送ってきた場合など
-		if pkt.SeqID == 0 && nextSeqID != 0 {
-			log.Println("Detected Seq Reset. Resetting reassembly buffer.")
-			nextSeqID = 0
-			buffer = make(map[int64]Packet)
-			ipPacketBuffer.Reset()
-			reassembling = false
-		}
-		// ------------------------------------
-
-		if pkt.SeqID == nextSeqID {
-			// 期待通りの順番
-			processPacket(pkt)
-			nextSeqID++
-
-			// バッファにある後続を確認
-			for {
-				if nextPkt, ok := buffer[nextSeqID]; ok {
-					delete(buffer, nextSeqID)
-					processPacket(nextPkt)
-					nextSeqID++
-				} else {
-					break
-				}
-			}
-		} else if pkt.SeqID > nextSeqID {
-			// 未来のパケット (Keep buffer)
-			buffer[pkt.SeqID] = pkt
-		}
-		// 過去のパケットは無視
-	}
-}
-
-// ==========================================
-// サーバー側 (Internet <-> Server TUN <-> Connections)
-// ==========================================
-
-func runServer(iface *water.Interface, addr string, fragSize int) {
+func runServer(addr string) {
 	listener, err := net.Listen("tcp", addr)
-	if err != nil { log.Fatalf("Listen error: %v", err) }
-	log.Printf("[Server] Listening on %s. Waiting for clients...", addr)
+	if err != nil {
+		log.Fatalf("Server listen error: %v", err)
+	}
+	log.Printf("[Server] Listening on %s. Waiting for connections...", addr)
 
-	// 受信集約用チャネル
-	packetIngress := make(chan Packet, 1000)
-	
-	// クライアント管理用 (簡易的に1クライアントのみサポートする構造にするが、リストに追加)
-	var clients []*ConnectionWrapper
-	var clientsMu sync.Mutex
+	// 受信したパケットを集約するチャネル
+	packetStream := make(chan Packet, 100)
 
-	// 1. [Download方向] Network(Client) -> Server -> TUN -> Internet
-	go networkToTunLoop(iface, packetIngress)
-
-	// 2. [Upload方向] Internet -> TUN -> Server -> Network(Client)
-	// TUNから来たパケットを接続中の全クライアントへ（本来はNATテーブルが必要だが、ここではブロードキャスト的に1つのセッションへ送る）
-	go func() {
-		packet := make([]byte, TunReadSize)
-		for {
-			n, err := iface.Read(packet)
-			if err != nil { log.Fatal(err) }
-			rawData := packet[:n]
-
-			// フラグメンテーションしてクライアントへ送り返す
-			offset := 0
-			for offset < n {
-				end := offset + fragSize
-				isLast := false
-				if end >= n { end = n; isLast = true }
-				
-				chunk := make([]byte, end-offset)
-				copy(chunk, rawData[offset:end])
-
-				seqMu.Lock()
-				currentSeq := globalSeqID
-				globalSeqID++
-				seqMu.Unlock()
-
-				pkt := Packet{
-					Type:    TypeData,
-					SeqID:   currentSeq,
-					Payload: chunk,
-					IsFin:   isLast,
-				}
-
-				// クライアントへ送信
-				clientsMu.Lock()
-				sendPacketWeighted(clients, pkt)
-				clientsMu.Unlock()
-
-				offset = end
-			}
-		}
-	}()
+	// 集約・再構成ルーチン（インターネット側への送信を模倣）
+	go aggregator(packetStream)
 
 	for {
 		conn, err := listener.Accept()
-		if err != nil { continue }
-		
-		go func(c net.Conn) {
-			// 認証 & 登録
-			if err := serverHandshake(c); err != nil {
-				c.Close()
-				return
-			}
-			
-			wrapper := &ConnectionWrapper{
-				Conn: c,
-				Enc:  gob.NewEncoder(c),
-				Alive: true,
-				BaseWeight: 10,
-				RTT: 10 * time.Millisecond,
-			}
-			
-			clientsMu.Lock()
-			// 既存リストに追加 (IDは簡易連番)
-			wrapper.ID = len(clients)
-			clients = append(clients, wrapper)
-			clientsMu.Unlock()
-			
-			log.Printf("Client connected: %s", c.RemoteAddr())
-
-			// 受信ループ
-			dec := gob.NewDecoder(c)
-			for {
-				var pkt Packet
-				if err := dec.Decode(&pkt); err != nil {
-					wrapper.Alive = false
-					return
-				}
-				if pkt.Type == TypePing {
-					go func(p Packet) {
-						pong := Packet{Type: TypePong, Timestamp: p.Timestamp}
-						wrapper.Mu.Lock()
-						wrapper.Enc.Encode(pong)
-						wrapper.Mu.Unlock()
-					}(pkt)
-				} else {
-					packetIngress <- pkt
-				}
-			}
-		}(conn)
+		if err != nil {
+			log.Printf("Accept error: %v", err)
+			continue
+		}
+		go handleConnection(conn, packetStream)
 	}
 }
 
-func serverHandshake(conn net.Conn) error {
-	// 簡易認証
+// handleConnection は各回線からの接続を処理し、認証後にパケットを読み込みます
+func handleConnection(conn net.Conn, out chan<- Packet) {
+	defer conn.Close()
+	log.Printf("[Server] New connection from %s", conn.RemoteAddr())
+
+	// 1. 認証フェーズ (簡易実装)
+	// サーバーからチャレンジ(ランダムバイト)を送信
 	challenge := make([]byte, ChallengeSize)
 	rand.Read(challenge)
-	conn.Write(challenge)
-	var msg HandshakeMsg
-	if err := gob.NewDecoder(conn).Decode(&msg); err != nil { return err }
-	// (署名検証は省略せず実装推奨だが、構成簡略化のためここではエラーチェックのみ)
-	return nil
-}
-
-// ==========================================
-// クライアント側 (App <-> Client TUN <-> Connections)
-// ==========================================
-
-func runClient(iface *water.Interface, serverAddr string, numLines int, fragSize int, weightStr string) {
-	// 重みパース
-	manualWeights := make([]int, numLines)
-	wParts := strings.Split(weightStr, ",")
-	for i := 0; i < numLines; i++ {
-		manualWeights[i] = 10
-		if i < len(wParts) {
-			fmt.Sscanf(wParts[i], "%d", &manualWeights[i])
-		}
+	if _, err := conn.Write(challenge); err != nil {
+		return
 	}
 
-	conns := make([]*ConnectionWrapper, numLines)
-	packetIngress := make(chan Packet, 1000)
+	// クライアントからの署名を受信
+	dec := gob.NewDecoder(conn)
+	var authMsg HandshakeMsg
+	if err := dec.Decode(&authMsg); err != nil {
+		log.Printf("Auth read failed: %v", err)
+		return
+	}
 
-	// 回線接続
-	for i := 0; i < numLines; i++ {
-		c, err := net.Dial("tcp", serverAddr)
-		if err != nil { log.Fatalf("Dial failed: %v", err) }
-		
-		// 認証
-		if err := clientHandshake(c); err != nil { log.Fatalf("Handshake failed: %v", err) }
+	// 署名検証
+	pubKey, err := parsePublicKey(authMsg.PublicKey)
+	if err != nil {
+		log.Printf("Invalid public key format")
+		return
+	}
+	
+	// SHA256ハッシュを作成して検証
+	hashed := sha256.Sum256(challenge)
+	err = rsa.VerifyPKCS1v15(pubKey, crypto.SHA256, hashed[:], authMsg.Signature)
+	if err != nil {
+		log.Printf("[Server] Authentication FAILED from %s", conn.RemoteAddr())
+		return
+	}
+	log.Printf("[Server] Authentication SUCCESS from %s", conn.RemoteAddr())
 
-		cw := &ConnectionWrapper{
-			ID: i, Conn: c, Enc: gob.NewEncoder(c),
-			Alive: true, BaseWeight: manualWeights[i], RTT: 100 * time.Millisecond,
-		}
-		conns[i] = cw
-
-		// 受信ループ (Downloadデータ)
-		go func(wrapper *ConnectionWrapper) {
-			dec := gob.NewDecoder(wrapper.Conn)
-			for {
-				var pkt Packet
-				if err := dec.Decode(&pkt); err != nil {
-					wrapper.Alive = false
-					return
-				}
-				if pkt.Type == TypePong {
-					rtt := time.Since(time.Unix(0, pkt.Timestamp))
-					wrapper.Mu.Lock()
-					wrapper.RTT = rtt
-					wrapper.Alive = true
-					wrapper.Mu.Unlock()
-				} else {
-					packetIngress <- pkt
-				}
+	// 2. データ受信ループ
+	for {
+		var pkt Packet
+		if err := dec.Decode(&pkt); err != nil {
+			if err != io.EOF {
+				log.Printf("Read error: %v", err)
 			}
-		}(cw)
-
-		// Keepalive
-		go func(wrapper *ConnectionWrapper) {
-			tick := time.NewTicker(KeepAliveInterval)
-			for range tick.C {
-				if !wrapper.Alive { return }
-				p := Packet{Type: TypePing, Timestamp: time.Now().UnixNano()}
-				wrapper.Mu.Lock()
-				wrapper.Enc.Encode(p)
-				wrapper.Mu.Unlock()
-			}
-		}(cw)
-	}
-
-	log.Println("[Client] VPN Tunnel Established.")
-
-	// 1. [Download方向] Server -> Client -> TUN -> App
-	go networkToTunLoop(iface, packetIngress)
-
-	// 2. [Upload方向] App -> TUN -> Client -> Server
-	tunToNetworkLoop(iface, conns, fragSize)
-}
-
-func clientHandshake(conn net.Conn) error {
-	buf := make([]byte, ChallengeSize)
-	io.ReadFull(conn, buf)
-	hashed := sha256.Sum256(buf)
-	sig, _ := rsa.SignPKCS1v15(rand.Reader, clientPrivKey, crypto.SHA256, hashed[:])
-	pub, _ := x509.MarshalPKIXPublicKey(&clientPrivKey.PublicKey)
-	msg := HandshakeMsg{PublicKey: pub, Signature: sig}
-	return gob.NewEncoder(conn).Encode(msg)
-}
-
-// ==========================================
-// ユーティリティ: 重み付き送信
-// ==========================================
-
-func sendPacketWeighted(conns []*ConnectionWrapper, pkt Packet) {
-	// 生きている回線を抽出 & スコア計算
-	type Candidate struct {
-		C *ConnectionWrapper
-		Score float64
-	}
-	var candidates []Candidate
-	var totalScore float64
-
-	for _, c := range conns {
-		c.Mu.Lock()
-		alive := c.Alive
-		rtt := c.RTT
-		bw := c.BaseWeight
-		c.Mu.Unlock()
-
-		if !alive { continue }
-
-		ms := float64(rtt.Milliseconds())
-		if ms <= 0 { ms = 1 }
-		score := float64(bw) * (100.0 / ms)
-		
-		candidates = append(candidates, Candidate{c, score})
-		totalScore += score
-	}
-
-	if len(candidates) == 0 { return }
-
-	// 抽選
-	r, _ := rand.Int(rand.Reader, big.NewInt(1000))
-	randVal := float64(r.Int64()) / 1000.0 * totalScore
-
-	var target *ConnectionWrapper
-	current := 0.0
-	for _, cand := range candidates {
-		current += cand.Score
-		if randVal < current {
-			target = cand.C
 			break
 		}
+		// 集約チャネルへ送信
+		out <- pkt
 	}
-	if target == nil { target = candidates[len(candidates)-1].C }
+}
 
-	// 送信
-	target.Mu.Lock()
-	err := target.Enc.Encode(pkt)
-	target.Mu.Unlock()
-	if err != nil {
-		log.Printf("Send failed on line %d", target.ID)
+// aggregator は複数の回線から来たパケットを1系統にまとめ、本来は順序制御を行います
+func aggregator(in <-chan Packet) {
+	log.Println("[Server] Aggregator started. Reassembling packets...")
+	
+	// 本来はここでバッファリングを行い、SeqID順に並べ替える処理が必要です (Min-Heap等を使用)
+	// 今回は簡易的に受信順に出力します
+	
+	for pkt := range in {
+		// インターネット側への送信をシミュレーション（標準出力）
+		fmt.Printf("[Internet-Out] Seq:%d | Data Size:%d bytes | Payload: %s\n", 
+			pkt.SeqID, len(pkt.Payload), string(pkt.Payload))
 	}
+}
+
+// --- クライアント側実装（振り分け） ---
+
+func runClient(serverAddr string, numLines int) {
+	log.Printf("[Client] Starting... Connecting to %s with %d lines", serverAddr, numLines)
+
+	var conns []net.Conn
+	var encoders []*gob.Encoder
+	
+	// 複数回線の確立
+	for i := 0; i < numLines; i++ {
+		conn, err := net.Dial("tcp", serverAddr)
+		if err != nil {
+			log.Fatalf("Dial failed for line %d: %v", i, err)
+		}
+		
+		// 認証実行
+		if err := performClientHandshake(conn); err != nil {
+			log.Fatalf("Handshake failed for line %d: %v", i, err)
+		}
+		
+		conns = append(conns, conn)
+		encoders = append(encoders, gob.NewEncoder(conn))
+		log.Printf("[Client] Line %d connected and authenticated", i)
+	}
+
+	defer func() {
+		for _, c := range conns { c.Close() }
+	}()
+
+	// 下流（ユーザー側）からの入力をシミュレーション
+	// 実際は TUN/TAP デバイスからの Read になります
+	inputScanner := bufio.NewScanner(os.Stdin)
+	log.Println("[Client] Ready. Type text and press Enter to send packets (split across lines).")
+
+	var seqID int64 = 0
+	
+	// ラウンドロビン方式で振り分け
+	currentLine := 0
+
+	for inputScanner.Scan() {
+		data := inputScanner.Bytes()
+		
+		// パケット作成
+		pkt := Packet{
+			SeqID:   seqID,
+			Payload: data, // 本来はコピーが必要ですがデモのためそのまま
+		}
+		seqID++
+
+		// 振り分けロジック (Round-Robin)
+		targetEnc := encoders[currentLine]
+		log.Printf("[Client] Sending Seq:%d via Line %d", pkt.SeqID, currentLine)
+
+		if err := targetEnc.Encode(pkt); err != nil {
+			log.Printf("Send error on line %d: %v", currentLine, err)
+			// 本来はここで再接続や別の回線へのフォールバック処理が必要
+		}
+
+		currentLine = (currentLine + 1) % len(conns)
+	}
+}
+
+func performClientHandshake(conn net.Conn) error {
+	// 1. チャレンジ受信
+	challenge := make([]byte, ChallengeSize)
+	if _, err := io.ReadFull(conn, challenge); err != nil {
+		return err
+	}
+
+	// 2. 署名作成
+	hashed := sha256.Sum256(challenge)
+	signature, err := rsa.SignPKCS1v15(rand.Reader, clientPrivKey, crypto.SHA256, hashed[:])
+	if err != nil {
+		return err
+	}
+
+	// 公開鍵をバイト列化 (送信するため)
+	pubASN1, _ := x509.MarshalPKIXPublicKey(&clientPrivKey.PublicKey)
+	pubBytes := pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PUBLIC KEY",
+		Bytes: pubASN1,
+	})
+
+	// 3. 認証メッセージ送信
+	msg := HandshakeMsg{
+		PublicKey: pubBytes,
+		Signature: signature,
+	}
+	
+	enc := gob.NewEncoder(conn)
+	return enc.Encode(msg)
+}
+
+// --- ユーティリティ ---
+
+func parsePublicKey(pemBytes []byte) (*rsa.PublicKey, error) {
+	block, _ := pem.Decode(pemBytes)
+	if block == nil {
+		return nil, fmt.Errorf("failed to parse PEM block")
+	}
+	pub, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		return nil, err
+	}
+	return pub.(*rsa.PublicKey), nil
 }
