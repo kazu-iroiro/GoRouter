@@ -171,43 +171,32 @@ func setupRoutes(tunName, serverIP, gatewayIP string) error {
 	}
 
 	// 1. VPNサーバーへの通信は、物理ゲートウェイを通るように固定（ループ防止）
-	// sudo ip route add <ServerIP> via <GatewayIP>
-	log.Printf("Adding static route to VPN Server %s via %s", serverIP, gatewayIP)
+	// 既存の設定があるかもしれないので、削除を試みてから追加する（強制上書き）
+	log.Printf("Configuring route to VPN Server %s via %s", serverIP, gatewayIP)
+	exec.Command("ip", "route", "del", serverIP).Run() // 失敗しても無視
+
 	cmd := exec.Command("ip", "route", "add", serverIP, "via", gatewayIP)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		// 修正: すでにルートが存在する場合("File exists")はエラーにせず続行する
-		if strings.Contains(string(out), "File exists") {
-			log.Printf("[INFO] Route to server %s already exists. Skipping add.", serverIP)
-		} else {
-			return fmt.Errorf("failed to add server route: %v, %s", err, out)
-		}
+		return fmt.Errorf("failed to add server route: %v, %s", err, out)
 	}
 
 	// 2. デフォルトルートをTUNに向ける (0.0.0.0/1 と 128.0.0.0/1 で 0.0.0.0/0 をカバー)
-	// これにより既存のdefault routeを削除せずに上書きできる
 	log.Printf("Redirecting all traffic to %s", tunName)
 	
+	// 0.0.0.0/1
+	exec.Command("ip", "route", "del", "0.0.0.0/1").Run()
 	cmd = exec.Command("ip", "route", "add", "0.0.0.0/1", "dev", tunName)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		// cleanupRoutes(tunName, serverIP, gatewayIP) // 失敗時は残った設定を手動で消してもらうか、ここで戻すか。今回は続行させないために戻す
-		// ただし、0.0.0.0/1 が失敗しても File exists なら続行したいケースもあるが、通常TUNの再作成で消えているはず。
-		// ここでも File exists を許容するように修正
-		if strings.Contains(string(out), "File exists") {
-			log.Printf("[INFO] Route 0.0.0.0/1 already exists. Skipping.")
-		} else {
-			cleanupRoutes(tunName, serverIP, gatewayIP)
-			return fmt.Errorf("failed to add 0.0.0.0/1: %v, %s", err, out)
-		}
+		cleanupRoutes(tunName, serverIP, gatewayIP)
+		return fmt.Errorf("failed to add 0.0.0.0/1: %v, %s", err, out)
 	}
 
+	// 128.0.0.0/1
+	exec.Command("ip", "route", "del", "128.0.0.0/1").Run()
 	cmd = exec.Command("ip", "route", "add", "128.0.0.0/1", "dev", tunName)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		if strings.Contains(string(out), "File exists") {
-			log.Printf("[INFO] Route 128.0.0.0/1 already exists. Skipping.")
-		} else {
-			cleanupRoutes(tunName, serverIP, gatewayIP)
-			return fmt.Errorf("failed to add 128.0.0.0/1: %v, %s", err, out)
-		}
+		cleanupRoutes(tunName, serverIP, gatewayIP)
+		return fmt.Errorf("failed to add 128.0.0.0/1: %v, %s", err, out)
 	}
 
 	return nil
