@@ -7,6 +7,7 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
+	"encoding/binary" // 追加
 	"encoding/gob"
 	"encoding/pem"
 	"flag"
@@ -28,7 +29,7 @@ import (
 // --- 設定・定数 ---
 
 const (
-	ProtocolVersion   = "BOND/4.0-CERT-AUTH"
+	ProtocolVersion   = "BOND/4.1-RAW-AUTH"
 	ChallengeSize     = 32
 	KeepAliveInterval = 10 * time.Second
 	TunReadSize       = 2000 // OSから読み取るパケットの最大サイズ
@@ -52,20 +53,16 @@ type Packet struct {
 	Timestamp int64
 }
 
-// HandshakeMsg 認証用
-type HandshakeMsg struct {
-	// 公開鍵は事前に共有されているため送信しない
-	Signature []byte
-}
+// HandshakeMsg 構造体は廃止し、直接バイナリ送信を行います
 
 // --- グローバル変数 ---
 var (
 	// ファイルから読み込んだ鍵
-	myPrivKey      *rsa.PrivateKey // クライアント用: 自分の秘密鍵
-	targetPubKey   *rsa.PublicKey  // サーバー用: 検証したいクライアントの公開鍵
-	
-	globalSeqID    int64      // 送信用シーケンス番号
-	seqMu          sync.Mutex // SeqID用Mutex
+	myPrivKey    *rsa.PrivateKey // クライアント用: 自分の秘密鍵
+	targetPubKey *rsa.PublicKey  // サーバー用: 検証したいクライアントの公開鍵
+
+	globalSeqID int64      // 送信用シーケンス番号
+	seqMu       sync.Mutex // SeqID用Mutex
 )
 
 // initでの鍵自動生成は廃止
@@ -79,11 +76,11 @@ func main() {
 	vip := flag.String("vip", "10.0.0.1/24", "Virtual IP CIDR for TUN interface")
 	weights := flag.String("weights", "", "Comma separated weights")
 	ifaces := flag.String("ifaces", "", "Comma separated interface names to bind")
-	
+
 	// 鍵ファイル指定用フラグ
 	privKeyFile := flag.String("priv", "private.pem", "Private key file path (Client mode)")
 	pubKeyFile := flag.String("pub", "public.pem", "Public key file path (Server mode)")
-	
+
 	flag.Parse()
 
 	// --- モード分岐 ---
@@ -144,7 +141,7 @@ func generateAndSaveKeys() error {
 		return err
 	}
 	defer privFile.Close()
-	
+
 	privBytes := x509.MarshalPKCS1PrivateKey(priv)
 	if err := pem.Encode(privFile, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: privBytes}); err != nil {
 		return err
@@ -166,7 +163,7 @@ func generateAndSaveKeys() error {
 		return err
 	}
 	log.Println("Saved: public.pem")
-	
+
 	return nil
 }
 
@@ -405,7 +402,7 @@ func runServer(iface *water.Interface, addr string, fragSize int) {
 
 		go func(c net.Conn) {
 			if err := serverHandshake(c); err != nil {
-				log.Printf("[Auth Failed] %v", err)
+				log.Printf("[Auth Failed] %v. Hint: Ensure Client's 'private.pem' matches Server's 'public.pem'.", err)
 				c.Close()
 				return
 			}
@@ -442,27 +439,33 @@ func runServer(iface *water.Interface, addr string, fragSize int) {
 	}
 }
 
-// サーバー側ハンドシェイク: 事前にロードした公開鍵で署名を検証
+// サーバー側ハンドシェイク: gobを使わずRawバイナリで署名を検証
 func serverHandshake(conn net.Conn) error {
-	// 1. チャレンジ送信
+	// 1. チャレンジ送信 (32 bytes)
 	challenge := make([]byte, ChallengeSize)
 	rand.Read(challenge)
 	if _, err := conn.Write(challenge); err != nil {
 		return err
 	}
 
-	// 2. 署名受信
-	var msg HandshakeMsg
-	if err := gob.NewDecoder(conn).Decode(&msg); err != nil {
+	// 2. 署名長受信 (uint16)
+	var sigLen uint16
+	if err := binary.Read(conn, binary.BigEndian, &sigLen); err != nil {
 		return err
 	}
 
-	// 3. 署名検証 (事前ロードした targetPubKey を使用)
+	// 3. 署名本体受信
+	sig := make([]byte, sigLen)
+	if _, err := io.ReadFull(conn, sig); err != nil {
+		return err
+	}
+
+	// 4. 署名検証
 	hashed := sha256.Sum256(challenge)
-	if err := rsa.VerifyPKCS1v15(targetPubKey, crypto.SHA256, hashed[:], msg.Signature); err != nil {
+	if err := rsa.VerifyPKCS1v15(targetPubKey, crypto.SHA256, hashed[:], sig); err != nil {
 		return fmt.Errorf("signature verification failed: %v", err)
 	}
-	
+
 	return nil
 }
 
@@ -572,7 +575,7 @@ func resolveInterfaceIP(ifaceName string) (*net.TCPAddr, error) {
 	return nil, fmt.Errorf("no valid IPv4 address found for interface %s", ifaceName)
 }
 
-// クライアント側ハンドシェイク: 事前にロードした秘密鍵で署名を作成
+// クライアント側ハンドシェイク: gobを使わずRawバイナリで署名を送信
 func clientHandshake(conn net.Conn) error {
 	// 1. チャレンジ受信
 	buf := make([]byte, ChallengeSize)
@@ -580,16 +583,24 @@ func clientHandshake(conn net.Conn) error {
 		return err
 	}
 
-	// 2. 署名作成 (myPrivKeyを使用)
+	// 2. 署名作成
 	hashed := sha256.Sum256(buf)
 	sig, err := rsa.SignPKCS1v15(rand.Reader, myPrivKey, crypto.SHA256, hashed[:])
 	if err != nil {
 		return err
 	}
 
-	// 3. 送信 (公開鍵は送らない)
-	msg := HandshakeMsg{Signature: sig}
-	return gob.NewEncoder(conn).Encode(msg)
+	// 3. 署名長送信 (uint16)
+	if err := binary.Write(conn, binary.BigEndian, uint16(len(sig))); err != nil {
+		return err
+	}
+
+	// 4. 署名本体送信
+	if _, err := conn.Write(sig); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func sendPacketWeighted(conns []*ConnectionWrapper, pkt Packet) {
