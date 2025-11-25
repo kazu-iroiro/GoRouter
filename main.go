@@ -32,7 +32,7 @@ import (
 // --- 設定・定数 ---
 
 const (
-	ProtocolVersion   = "BOND/4.9-POLICY-ROUTING"
+	ProtocolVersion   = "BOND/4.11-ONLINK-FIX"
 	ChallengeSize     = 32
 	KeepAliveInterval = 10 * time.Second
 	TunReadSize       = 4096 
@@ -176,7 +176,6 @@ func setupRoutes(tunName, serverIP string, gatewayIPs []string, bindIfaces []str
 	}
 
 	// 1. Policy Routing: インターフェースごとに専用のルーティングテーブルを作成する
-	// これにより、アプリが特定のIFにバインドした通信は、確実にそのIFのゲートウェイを通る
 	startTableID := 201
 
 	for i, gw := range gatewayIPs {
@@ -184,27 +183,28 @@ func setupRoutes(tunName, serverIP string, gatewayIPs []string, bindIfaces []str
 		ifName := bindIfaces[i]
 		tableID := fmt.Sprintf("%d", startTableID + i)
 
-		// インターフェースのIPを取得 (Policy Ruleの条件にするため)
 		localAddr, err := resolveInterfaceIP(ifName)
 		if err != nil {
 			return fmt.Errorf("failed to resolve IP for %s: %v", ifName, err)
 		}
 		srcIP := localAddr.IP.String()
 
+		if srcIP == gw {
+			return fmt.Errorf("invalid configuration: Gateway IP (%s) matches Interface IP (%s).", gw, srcIP)
+		}
+
 		log.Printf("Setting up policy routing for %s (IP: %s, GW: %s, Table: %s)", ifName, srcIP, gw, tableID)
 
-		// ルール追加: "from <SrcIP> lookup <TableID>"
-		// 優先度(prio)を標準より高く設定
-		exec.Command("ip", "rule", "del", "from", srcIP, "table", tableID).Run() // クリーンアップ
+		// ルール追加
+		exec.Command("ip", "rule", "del", "from", srcIP, "table", tableID).Run()
 		cmd := exec.Command("ip", "rule", "add", "from", srcIP, "table", tableID, "prio", "100")
 		if out, err := cmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("rule add failed: %v, %s", err, out)
 		}
 
-		// ルート追加: "ip route add <ServerIP> via <GW> dev <IF> table <TableID>"
-		// これで、このテーブルを使うパケットは指定のGWを経由してサーバーへ行く
+		// ルート追加: onlink フラグを追加して、GWへの到達性を強制する
 		exec.Command("ip", "route", "del", serverIP, "table", tableID).Run()
-		cmd = exec.Command("ip", "route", "add", serverIP, "via", gw, "dev", ifName, "table", tableID)
+		cmd = exec.Command("ip", "route", "add", serverIP, "via", gw, "dev", ifName, "table", tableID, "onlink")
 		if out, err := cmd.CombinedOutput(); err != nil {
 			if !strings.Contains(string(out), "File exists") {
 				return fmt.Errorf("route add table failed: %v, %s", err, out)
@@ -212,8 +212,22 @@ func setupRoutes(tunName, serverIP string, gatewayIPs []string, bindIfaces []str
 		}
 	}
 
-	// 2. デフォルトルートをTUNに向ける (メインテーブルの設定)
-	// 0.0.0.0/1 と 128.0.0.0/1 で全トラフィックをカバー
+	// 2. メインテーブルへのフォールバックルート追加 (ループ防止の命綱)
+	// 最初の有効なゲートウェイを使って、メインテーブルにも明示的なルートを入れる
+	if len(gatewayIPs) > 0 && len(bindIfaces) > 0 {
+		fallbackGW := gatewayIPs[0]
+		log.Printf("Adding fallback route to VPN Server %s via %s (Main Table)", serverIP, fallbackGW)
+		
+		exec.Command("ip", "route", "del", serverIP).Run()
+		cmd := exec.Command("ip", "route", "add", serverIP, "via", fallbackGW)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			if !strings.Contains(string(out), "File exists") {
+				log.Printf("[WARN] Failed to add fallback route to main table: %v", err)
+			}
+		}
+	}
+
+	// 3. デフォルトルートをTUNに向ける (メインテーブルの設定)
 	log.Printf("Redirecting all traffic to %s (Main Table)", tunName)
 	
 	exec.Command("ip", "route", "del", "0.0.0.0/1").Run()
@@ -238,6 +252,9 @@ func cleanupRoutes(tunName, serverIP string, gatewayIPs []string, bindIfaces []s
 	exec.Command("ip", "route", "del", "0.0.0.0/1", "dev", tunName).Run()
 	exec.Command("ip", "route", "del", "128.0.0.0/1", "dev", tunName).Run()
 	
+	// メインテーブルのサーバーへのルート削除
+	exec.Command("ip", "route", "del", serverIP).Run()
+
 	startTableID := 201
 	for i, _ := range gatewayIPs {
 		if i >= len(bindIfaces) || bindIfaces[i] == "" { continue }
@@ -250,7 +267,6 @@ func cleanupRoutes(tunName, serverIP string, gatewayIPs []string, bindIfaces []s
 			exec.Command("ip", "rule", "del", "from", srcIP, "table", tableID).Run()
 		}
 		exec.Command("ip", "route", "del", serverIP, "table", tableID).Run()
-		// flush table
 		exec.Command("ip", "route", "flush", "table", tableID).Run()
 	}
 }
