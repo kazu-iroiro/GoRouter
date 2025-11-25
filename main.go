@@ -15,6 +15,7 @@ import (
 	"math/big"
 	"net"
 	"os/exec"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -25,7 +26,7 @@ import (
 // --- 設定・定数 ---
 
 const (
-	ProtocolVersion   = "BOND/3.2-TUN-BIND"
+	ProtocolVersion   = "BOND/3.4-CROSS-COMPAT"
 	ChallengeSize     = 32
 	KeepAliveInterval = 10 * time.Second
 	TunReadSize       = 2000 // OSから読み取るパケットの最大サイズ
@@ -66,9 +67,13 @@ var (
 func init() {
 	var err error
 	serverPrivKey, err = rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil { log.Fatal(err) }
+	if err != nil {
+		log.Fatal(err)
+	}
 	clientPrivKey, err = rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil { log.Fatal(err) }
+	if err != nil {
+		log.Fatal(err)
+	}
 }
 
 func main() {
@@ -99,23 +104,43 @@ func main() {
 // --- TUN Interface Setup ---
 
 func setupTUN(cidr string, mtu int) (*water.Interface, error) {
+	if runtime.GOOS != "linux" {
+		log.Printf("[WARNING] You are running on %s, but this code uses Linux-specific 'ip' commands. It will likely fail.", runtime.GOOS)
+	}
+
+	// インターフェース設定
 	config := water.Config{
 		DeviceType: water.TUN,
 	}
+	// Note: config.PlatformSpecificParams.Name はLinux限定フィールドのため削除しました。
+	// 名前はOSによって自動割り当てされます (例: tun0, tun1)
+
+	// 1. TUNデバイスの作成
+	log.Println("Attempting to create TUN device...")
 	iface, err := water.New(config)
 	if err != nil {
-		return nil, err
+		// ここで詳細なエラーを返す
+		return nil, fmt.Errorf("failed to create TUN device via syscall: %v\n(Hint: Are you running with sudo? Is /dev/net/tun accessible?)", err)
 	}
-	log.Printf("Interface %s created", iface.Name())
+	log.Printf("TUN device created successfully: Name=%s", iface.Name())
 
+	// 2. リンクアップ待機 (OS認識待ち)
+	time.Sleep(100 * time.Millisecond)
+
+	// 3. IPアドレスの設定
+	log.Printf("Assigning IP %s to %s...", cidr, iface.Name())
 	cmd := exec.Command("ip", "addr", "add", cidr, "dev", iface.Name())
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("ip addr add failed: %v, out: %s", err, out)
+		// IP割り当て失敗
+		return nil, fmt.Errorf("ip addr add failed: %v\nCommand Output: %s", err, string(out))
 	}
 
+	// 4. MTU設定とリンクアップ
+	log.Printf("Setting MTU %d and bringing up %s...", mtu, iface.Name())
 	cmd = exec.Command("ip", "link", "set", "dev", iface.Name(), "mtu", fmt.Sprintf("%d", mtu), "up")
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("ip link set up failed: %v, out: %s", err, out)
+		// リンクアップ失敗
+		return nil, fmt.Errorf("ip link set up failed: %v\nCommand Output: %s", err, string(out))
 	}
 
 	return iface, nil
@@ -135,6 +160,7 @@ type ConnectionWrapper struct {
 	BaseWeight int
 }
 
+// TUNからパケットを読み出し -> 分割 -> ネットワークへ送信
 func tunToNetworkLoop(iface *water.Interface, conns []*ConnectionWrapper, fragSize int) {
 	packet := make([]byte, TunReadSize)
 
@@ -153,7 +179,7 @@ func tunToNetworkLoop(iface *water.Interface, conns []*ConnectionWrapper, fragSi
 				end = n
 				isLast = true
 			}
-			
+
 			chunk := make([]byte, end-offset)
 			copy(chunk, rawData[offset:end])
 
@@ -175,13 +201,16 @@ func tunToNetworkLoop(iface *water.Interface, conns []*ConnectionWrapper, fragSi
 	}
 }
 
+// ネットワークからパケット受信 -> 再構成 -> TUNへ書き込み
 func networkToTunLoop(iface *water.Interface, pktChan <-chan Packet) {
 	var nextSeqID int64 = 0
 	buffer := make(map[int64]Packet)
 	var ipPacketBuffer bytes.Buffer
 
 	processPacket := func(pkt Packet) {
-		if pkt.Type != TypeData { return }
+		if pkt.Type != TypeData {
+			return
+		}
 
 		ipPacketBuffer.Write(pkt.Payload)
 
@@ -228,28 +257,37 @@ func networkToTunLoop(iface *water.Interface, pktChan <-chan Packet) {
 
 func runServer(iface *water.Interface, addr string, fragSize int) {
 	listener, err := net.Listen("tcp", addr)
-	if err != nil { log.Fatalf("Listen error: %v", err) }
+	if err != nil {
+		log.Fatalf("Listen error: %v", err)
+	}
 	log.Printf("[Server] Listening on %s", addr)
 
 	packetIngress := make(chan Packet, 1000)
 	var clients []*ConnectionWrapper
 	var clientsMu sync.Mutex
 
+	// [Download方向] Network -> TUN -> Internet
 	go networkToTunLoop(iface, packetIngress)
 
+	// [Upload方向] Internet -> TUN -> Network (全クライアントへ)
 	go func() {
 		packet := make([]byte, TunReadSize)
 		for {
 			n, err := iface.Read(packet)
-			if err != nil { log.Fatal(err) }
+			if err != nil {
+				log.Fatal(err)
+			}
 			rawData := packet[:n]
 
 			offset := 0
 			for offset < n {
 				end := offset + fragSize
 				isLast := false
-				if end >= n { end = n; isLast = true }
-				
+				if end >= n {
+					end = n
+					isLast = true
+				}
+
 				chunk := make([]byte, end-offset)
 				copy(chunk, rawData[offset:end])
 
@@ -276,23 +314,25 @@ func runServer(iface *water.Interface, addr string, fragSize int) {
 
 	for {
 		conn, err := listener.Accept()
-		if err != nil { continue }
-		
+		if err != nil {
+			continue
+		}
+
 		go func(c net.Conn) {
 			if err := serverHandshake(c); err != nil {
 				c.Close()
 				return
 			}
-			
+
 			wrapper := &ConnectionWrapper{
 				Conn: c, Enc: gob.NewEncoder(c), Alive: true, BaseWeight: 10, RTT: 10 * time.Millisecond,
 			}
-			
+
 			clientsMu.Lock()
 			wrapper.ID = len(clients)
 			clients = append(clients, wrapper)
 			clientsMu.Unlock()
-			
+
 			log.Printf("Client connected: %s", c.RemoteAddr())
 
 			dec := gob.NewDecoder(c)
@@ -322,7 +362,9 @@ func serverHandshake(conn net.Conn) error {
 	rand.Read(challenge)
 	conn.Write(challenge)
 	var msg HandshakeMsg
-	if err := gob.NewDecoder(conn).Decode(&msg); err != nil { return err }
+	if err := gob.NewDecoder(conn).Decode(&msg); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -350,7 +392,7 @@ func runClient(iface *water.Interface, serverAddr string, numLines int, fragSize
 	for i := 0; i < numLines; i++ {
 		// 特定のインターフェースにバインドするDialerを作成
 		dialer := net.Dialer{Timeout: 10 * time.Second}
-		
+
 		if i < len(bindIfaces) && strings.TrimSpace(bindIfaces[i]) != "" {
 			targetIface := strings.TrimSpace(bindIfaces[i])
 			localAddr, err := resolveInterfaceIP(targetIface)
@@ -362,9 +404,13 @@ func runClient(iface *water.Interface, serverAddr string, numLines int, fragSize
 		}
 
 		c, err := dialer.Dial("tcp", serverAddr)
-		if err != nil { log.Fatalf("Dial failed line %d: %v", i, err) }
-		
-		if err := clientHandshake(c); err != nil { log.Fatalf("Handshake failed: %v", err) }
+		if err != nil {
+			log.Fatalf("Dial failed line %d: %v", i, err)
+		}
+
+		if err := clientHandshake(c); err != nil {
+			log.Fatalf("Handshake failed: %v", err)
+		}
 
 		cw := &ConnectionWrapper{
 			ID: i, Conn: c, Enc: gob.NewEncoder(c),
@@ -397,7 +443,9 @@ func runClient(iface *water.Interface, serverAddr string, numLines int, fragSize
 		go func(wrapper *ConnectionWrapper) {
 			tick := time.NewTicker(KeepAliveInterval)
 			for range tick.C {
-				if !wrapper.Alive { return }
+				if !wrapper.Alive {
+					return
+				}
 				p := Packet{Type: TypePing, Timestamp: time.Now().UnixNano()}
 				wrapper.Mu.Lock()
 				wrapper.Enc.Encode(p)
@@ -431,7 +479,7 @@ func resolveInterfaceIP(ifaceName string) (*net.TCPAddr, error) {
 			}
 		}
 	}
-	
+
 	return nil, fmt.Errorf("no valid IPv4 address found for interface %s", ifaceName)
 }
 
@@ -451,7 +499,7 @@ func clientHandshake(conn net.Conn) error {
 
 func sendPacketWeighted(conns []*ConnectionWrapper, pkt Packet) {
 	type Candidate struct {
-		C *ConnectionWrapper
+		C     *ConnectionWrapper
 		Score float64
 	}
 	var candidates []Candidate
@@ -464,17 +512,23 @@ func sendPacketWeighted(conns []*ConnectionWrapper, pkt Packet) {
 		bw := c.BaseWeight
 		c.Mu.Unlock()
 
-		if !alive { continue }
+		if !alive {
+			continue
+		}
 
 		ms := float64(rtt.Milliseconds())
-		if ms <= 0 { ms = 1 }
+		if ms <= 0 {
+			ms = 1
+		}
 		score := float64(bw) * (100.0 / ms)
-		
+
 		candidates = append(candidates, Candidate{c, score})
 		totalScore += score
 	}
 
-	if len(candidates) == 0 { return }
+	if len(candidates) == 0 {
+		return
+	}
 
 	r, _ := rand.Int(rand.Reader, big.NewInt(1000))
 	randVal := float64(r.Int64()) / 1000.0 * totalScore
@@ -488,7 +542,9 @@ func sendPacketWeighted(conns []*ConnectionWrapper, pkt Packet) {
 			break
 		}
 	}
-	if target == nil { target = candidates[len(candidates)-1].C }
+	if target == nil {
+		target = candidates[len(candidates)-1].C
+	}
 
 	target.Mu.Lock()
 	err := target.Enc.Encode(pkt)
