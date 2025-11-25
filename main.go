@@ -32,7 +32,7 @@ import (
 // --- 設定・定数 ---
 
 const (
-	ProtocolVersion   = "BOND/4.8-MULTIPATH-GW"
+	ProtocolVersion   = "BOND/4.9-POLICY-ROUTING"
 	ChallengeSize     = 32
 	KeepAliveInterval = 10 * time.Second
 	TunReadSize       = 4096 
@@ -135,7 +135,7 @@ func main() {
 			for i := range gateways { gateways[i] = strings.TrimSpace(gateways[i]) }
 			for i := range bindIfacesList { bindIfacesList[i] = strings.TrimSpace(bindIfacesList[i]) }
 
-			// ルート設定適用
+			// ルート設定適用 (Policy Routing)
 			if err := setupRoutes(iface.Name(), serverHost, gateways, bindIfacesList); err != nil {
 				log.Printf("[WARN] Failed to setup routes: %v", err)
 			} else {
@@ -146,7 +146,7 @@ func main() {
 				go func() {
 					<-c
 					log.Println("\n[INFO] Cleaning up routes and exiting...")
-					cleanupRoutes(iface.Name(), serverHost, gateways)
+					cleanupRoutes(iface.Name(), serverHost, gateways, bindIfacesList)
 					iface.Close()
 					os.Exit(0)
 				}()
@@ -167,7 +167,7 @@ func debugLog(format string, v ...interface{}) {
 }
 
 // ==========================================
-// ルーティング設定 (Linux用)
+// ルーティング設定 (Linux Policy Routing)
 // ==========================================
 
 func setupRoutes(tunName, serverIP string, gatewayIPs []string, bindIfaces []string) error {
@@ -175,86 +175,84 @@ func setupRoutes(tunName, serverIP string, gatewayIPs []string, bindIfaces []str
 		return fmt.Errorf("automatic routing is only supported on Linux")
 	}
 
-	// 1. VPNサーバーへの通信は、物理ゲートウェイを通るように固定（ループ防止）
-	// 既存の設定削除
-	exec.Command("ip", "route", "del", serverIP).Run()
+	// 1. Policy Routing: インターフェースごとに専用のルーティングテーブルを作成する
+	// これにより、アプリが特定のIFにバインドした通信は、確実にそのIFのゲートウェイを通る
+	startTableID := 201
 
-	var cmd *exec.Cmd
-	if len(gatewayIPs) == 1 {
-		// シングルゲートウェイ
-		log.Printf("Configuring route to VPN Server %s via %s", serverIP, gatewayIPs[0])
-		cmd = exec.Command("ip", "route", "add", serverIP, "via", gatewayIPs[0])
-	} else {
-		// マルチゲートウェイ (NexthopによるECMP設定)
-		// ip route add <ServerIP> nexthop via <GW1> dev <IF1> weight 1 nexthop via <GW2> dev <IF2> weight 1
-		args := []string{"route", "add", serverIP}
-		logMsg := fmt.Sprintf("Configuring multipath route to VPN Server %s via:", serverIP)
-		
-		for i, gw := range gatewayIPs {
-			logMsg += fmt.Sprintf(" [GW:%s", gw)
-			args = append(args, "nexthop", "via", gw)
-			
-			// 対応するインターフェースがあれば指定
-			if i < len(bindIfaces) && bindIfaces[i] != "" {
-				args = append(args, "dev", bindIfaces[i])
-				logMsg += fmt.Sprintf(" dev:%s]", bindIfaces[i])
-			} else {
-				logMsg += "]"
+	for i, gw := range gatewayIPs {
+		if i >= len(bindIfaces) || bindIfaces[i] == "" { continue }
+		ifName := bindIfaces[i]
+		tableID := fmt.Sprintf("%d", startTableID + i)
+
+		// インターフェースのIPを取得 (Policy Ruleの条件にするため)
+		localAddr, err := resolveInterfaceIP(ifName)
+		if err != nil {
+			return fmt.Errorf("failed to resolve IP for %s: %v", ifName, err)
+		}
+		srcIP := localAddr.IP.String()
+
+		log.Printf("Setting up policy routing for %s (IP: %s, GW: %s, Table: %s)", ifName, srcIP, gw, tableID)
+
+		// ルール追加: "from <SrcIP> lookup <TableID>"
+		// 優先度(prio)を標準より高く設定
+		exec.Command("ip", "rule", "del", "from", srcIP, "table", tableID).Run() // クリーンアップ
+		cmd := exec.Command("ip", "rule", "add", "from", srcIP, "table", tableID, "prio", "100")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("rule add failed: %v, %s", err, out)
+		}
+
+		// ルート追加: "ip route add <ServerIP> via <GW> dev <IF> table <TableID>"
+		// これで、このテーブルを使うパケットは指定のGWを経由してサーバーへ行く
+		exec.Command("ip", "route", "del", serverIP, "table", tableID).Run()
+		cmd = exec.Command("ip", "route", "add", serverIP, "via", gw, "dev", ifName, "table", tableID)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			if !strings.Contains(string(out), "File exists") {
+				return fmt.Errorf("route add table failed: %v, %s", err, out)
 			}
-			args = append(args, "weight", "1")
-		}
-		log.Println(logMsg)
-		cmd = exec.Command("ip", args...)
-	}
-
-	if out, err := cmd.CombinedOutput(); err != nil {
-		// 既に存在するなどのエラーは許容する場合もあるが、設定が間違っている可能性が高いのでエラーを返す
-		if strings.Contains(string(out), "File exists") {
-			log.Printf("[INFO] Route to server already exists. Skipping.")
-		} else {
-			return fmt.Errorf("failed to add server route: %v, %s", err, out)
 		}
 	}
 
-	// 2. デフォルトルートをTUNに向ける (0.0.0.0/1 と 128.0.0.0/1 で 0.0.0.0/0 をカバー)
-	log.Printf("Redirecting all traffic to %s", tunName)
+	// 2. デフォルトルートをTUNに向ける (メインテーブルの設定)
+	// 0.0.0.0/1 と 128.0.0.0/1 で全トラフィックをカバー
+	log.Printf("Redirecting all traffic to %s (Main Table)", tunName)
 	
-	// 0.0.0.0/1
 	exec.Command("ip", "route", "del", "0.0.0.0/1").Run()
-	cmd = exec.Command("ip", "route", "add", "0.0.0.0/1", "dev", tunName)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		if strings.Contains(string(out), "File exists") {
-			log.Printf("[INFO] Route 0.0.0.0/1 already exists. Skipping.")
-		} else {
-			cleanupRoutes(tunName, serverIP, gatewayIPs)
-			return fmt.Errorf("failed to add 0.0.0.0/1: %v, %s", err, out)
-		}
+	if out, err := exec.Command("ip", "route", "add", "0.0.0.0/1", "dev", tunName).CombinedOutput(); err != nil {
+		cleanupRoutes(tunName, serverIP, gatewayIPs, bindIfaces)
+		return fmt.Errorf("failed to add 0.0.0.0/1: %v, %s", err, out)
 	}
 
-	// 128.0.0.0/1
 	exec.Command("ip", "route", "del", "128.0.0.0/1").Run()
-	cmd = exec.Command("ip", "route", "add", "128.0.0.0/1", "dev", tunName)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		if strings.Contains(string(out), "File exists") {
-			log.Printf("[INFO] Route 128.0.0.0/1 already exists. Skipping.")
-		} else {
-			cleanupRoutes(tunName, serverIP, gatewayIPs)
-			return fmt.Errorf("failed to add 128.0.0.0/1: %v, %s", err, out)
-		}
+	if out, err := exec.Command("ip", "route", "add", "128.0.0.0/1", "dev", tunName).CombinedOutput(); err != nil {
+		cleanupRoutes(tunName, serverIP, gatewayIPs, bindIfaces)
+		return fmt.Errorf("failed to add 128.0.0.0/1: %v, %s", err, out)
 	}
 
 	return nil
 }
 
-func cleanupRoutes(tunName, serverIP string, gatewayIPs []string) {
+func cleanupRoutes(tunName, serverIP string, gatewayIPs []string, bindIfaces []string) {
 	if runtime.GOOS != "linux" { return }
 
 	log.Println("Restoring routing table...")
 	exec.Command("ip", "route", "del", "0.0.0.0/1", "dev", tunName).Run()
 	exec.Command("ip", "route", "del", "128.0.0.0/1", "dev", tunName).Run()
 	
-	// サーバーへのルート削除（nexthop設定でも宛先指定削除で消えるはず）
-	exec.Command("ip", "route", "del", serverIP).Run()
+	startTableID := 201
+	for i, _ := range gatewayIPs {
+		if i >= len(bindIfaces) || bindIfaces[i] == "" { continue }
+		ifName := bindIfaces[i]
+		tableID := fmt.Sprintf("%d", startTableID + i)
+		
+		localAddr, err := resolveInterfaceIP(ifName)
+		if err == nil {
+			srcIP := localAddr.IP.String()
+			exec.Command("ip", "rule", "del", "from", srcIP, "table", tableID).Run()
+		}
+		exec.Command("ip", "route", "del", serverIP, "table", tableID).Run()
+		// flush table
+		exec.Command("ip", "route", "flush", "table", tableID).Run()
+	}
 }
 
 // ==========================================
