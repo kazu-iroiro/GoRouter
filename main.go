@@ -693,5 +693,11 @@ func sendPacketWeighted(conns []*ConnectionWrapper, pkt Packet) error {
 	target.Mu.Lock()
 	err := target.Enc.Encode(pkt)
 	target.Mu.Unlock()
+
+	// 成功した場合、デバッグログに使用した回線IDを出力
+	if err == nil {
+		debugLog("Sent Seq:%d Size:%d via Line %d", pkt.SeqID, len(pkt.Payload), target.ID)
+	}
+
 	return err
 }
