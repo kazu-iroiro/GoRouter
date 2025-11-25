@@ -8,12 +8,14 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/gob"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"math/big"
 	"net"
+	"os"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -26,7 +28,7 @@ import (
 // --- 設定・定数 ---
 
 const (
-	ProtocolVersion   = "BOND/3.4-CROSS-COMPAT"
+	ProtocolVersion   = "BOND/4.0-CERT-AUTH"
 	ChallengeSize     = 32
 	KeepAliveInterval = 10 * time.Second
 	TunReadSize       = 2000 // OSから読み取るパケットの最大サイズ
@@ -52,40 +54,63 @@ type Packet struct {
 
 // HandshakeMsg 認証用
 type HandshakeMsg struct {
-	PublicKey []byte
+	// 公開鍵は事前に共有されているため送信しない
 	Signature []byte
 }
 
 // --- グローバル変数 ---
 var (
-	serverPrivKey *rsa.PrivateKey
-	clientPrivKey *rsa.PrivateKey
-	globalSeqID   int64      // 送信用シーケンス番号
-	seqMu         sync.Mutex // SeqID用Mutex
+	// ファイルから読み込んだ鍵
+	myPrivKey      *rsa.PrivateKey // クライアント用: 自分の秘密鍵
+	targetPubKey   *rsa.PublicKey  // サーバー用: 検証したいクライアントの公開鍵
+	
+	globalSeqID    int64      // 送信用シーケンス番号
+	seqMu          sync.Mutex // SeqID用Mutex
 )
 
-func init() {
-	var err error
-	serverPrivKey, err = rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		log.Fatal(err)
-	}
-	clientPrivKey, err = rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		log.Fatal(err)
-	}
-}
+// initでの鍵自動生成は廃止
 
 func main() {
-	mode := flag.String("mode", "server", "Mode: server or client")
+	mode := flag.String("mode", "server", "Mode: server, client, or keygen")
 	addr := flag.String("addr", "0.0.0.0:8080", "Server listen/connect address")
 	lines := flag.Int("lines", 2, "Number of connection lines (Client mode only)")
 	mtu := flag.Int("mtu", 1300, "Virtual Interface MTU")
 	fragSize := flag.Int("frag", 1024, "Fragmentation size")
 	vip := flag.String("vip", "10.0.0.1/24", "Virtual IP CIDR for TUN interface")
 	weights := flag.String("weights", "", "Comma separated weights")
-	ifaces := flag.String("ifaces", "", "Comma separated interface names to bind (e.g. 'eth0,wlan0')")
+	ifaces := flag.String("ifaces", "", "Comma separated interface names to bind")
+	
+	// 鍵ファイル指定用フラグ
+	privKeyFile := flag.String("priv", "private.pem", "Private key file path (Client mode)")
+	pubKeyFile := flag.String("pub", "public.pem", "Public key file path (Server mode)")
+	
 	flag.Parse()
+
+	// --- モード分岐 ---
+
+	if *mode == "keygen" {
+		if err := generateAndSaveKeys(); err != nil {
+			log.Fatalf("Failed to generate keys: %v", err)
+		}
+		return
+	}
+
+	// 鍵の読み込み
+	if *mode == "client" {
+		var err error
+		myPrivKey, err = loadPrivateKey(*privKeyFile)
+		if err != nil {
+			log.Fatalf("Failed to load private key from %s: %v", *privKeyFile, err)
+		}
+		log.Printf("Loaded private key from %s", *privKeyFile)
+	} else if *mode == "server" {
+		var err error
+		targetPubKey, err = loadPublicKey(*pubKeyFile)
+		if err != nil {
+			log.Fatalf("Failed to load public key from %s: %v", *pubKeyFile, err)
+		}
+		log.Printf("Loaded public key for verification from %s", *pubKeyFile)
+	}
 
 	// TUNインターフェースの作成
 	iface, err := setupTUN(*vip, *mtu)
@@ -101,46 +126,110 @@ func main() {
 	}
 }
 
-// --- TUN Interface Setup ---
+// ==========================================
+// 鍵管理・認証ロジック
+// ==========================================
+
+// 鍵ペア生成と保存
+func generateAndSaveKeys() error {
+	log.Println("Generating 2048-bit RSA key pair...")
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return err
+	}
+
+	// 秘密鍵の保存
+	privFile, err := os.Create("private.pem")
+	if err != nil {
+		return err
+	}
+	defer privFile.Close()
+	
+	privBytes := x509.MarshalPKCS1PrivateKey(priv)
+	if err := pem.Encode(privFile, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: privBytes}); err != nil {
+		return err
+	}
+	log.Println("Saved: private.pem")
+
+	// 公開鍵の保存
+	pubFile, err := os.Create("public.pem")
+	if err != nil {
+		return err
+	}
+	defer pubFile.Close()
+
+	pubASN1, err := x509.MarshalPKIXPublicKey(&priv.PublicKey)
+	if err != nil {
+		return err
+	}
+	if err := pem.Encode(pubFile, &pem.Block{Type: "RSA PUBLIC KEY", Bytes: pubASN1}); err != nil {
+		return err
+	}
+	log.Println("Saved: public.pem")
+	
+	return nil
+}
+
+func loadPrivateKey(path string) (*rsa.PrivateKey, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	block, _ := pem.Decode(data)
+	if block == nil {
+		return nil, fmt.Errorf("failed to parse PEM block containing the key")
+	}
+	return x509.ParsePKCS1PrivateKey(block.Bytes)
+}
+
+func loadPublicKey(path string) (*rsa.PublicKey, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	block, _ := pem.Decode(data)
+	if block == nil {
+		return nil, fmt.Errorf("failed to parse PEM block containing the key")
+	}
+	pub, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		return nil, err
+	}
+	return pub.(*rsa.PublicKey), nil
+}
+
+// ==========================================
+// TUN Interface Setup
+// ==========================================
 
 func setupTUN(cidr string, mtu int) (*water.Interface, error) {
 	if runtime.GOOS != "linux" {
-		log.Printf("[WARNING] You are running on %s, but this code uses Linux-specific 'ip' commands. It will likely fail.", runtime.GOOS)
+		log.Printf("[WARNING] You are running on %s, but this code uses Linux-specific 'ip' commands.", runtime.GOOS)
 	}
 
-	// インターフェース設定
 	config := water.Config{
 		DeviceType: water.TUN,
 	}
-	// Note: config.PlatformSpecificParams.Name はLinux限定フィールドのため削除しました。
-	// 名前はOSによって自動割り当てされます (例: tun0, tun1)
 
-	// 1. TUNデバイスの作成
 	log.Println("Attempting to create TUN device...")
 	iface, err := water.New(config)
 	if err != nil {
-		// ここで詳細なエラーを返す
-		return nil, fmt.Errorf("failed to create TUN device via syscall: %v\n(Hint: Are you running with sudo? Is /dev/net/tun accessible?)", err)
+		return nil, fmt.Errorf("failed to create TUN device: %v", err)
 	}
 	log.Printf("TUN device created successfully: Name=%s", iface.Name())
 
-	// 2. リンクアップ待機 (OS認識待ち)
 	time.Sleep(100 * time.Millisecond)
 
-	// 3. IPアドレスの設定
 	log.Printf("Assigning IP %s to %s...", cidr, iface.Name())
 	cmd := exec.Command("ip", "addr", "add", cidr, "dev", iface.Name())
 	if out, err := cmd.CombinedOutput(); err != nil {
-		// IP割り当て失敗
-		return nil, fmt.Errorf("ip addr add failed: %v\nCommand Output: %s", err, string(out))
+		return nil, fmt.Errorf("ip addr add failed: %v\nOutput: %s", err, string(out))
 	}
 
-	// 4. MTU設定とリンクアップ
 	log.Printf("Setting MTU %d and bringing up %s...", mtu, iface.Name())
 	cmd = exec.Command("ip", "link", "set", "dev", iface.Name(), "mtu", fmt.Sprintf("%d", mtu), "up")
 	if out, err := cmd.CombinedOutput(); err != nil {
-		// リンクアップ失敗
-		return nil, fmt.Errorf("ip link set up failed: %v\nCommand Output: %s", err, string(out))
+		return nil, fmt.Errorf("ip link set up failed: %v\nOutput: %s", err, string(out))
 	}
 
 	return iface, nil
@@ -160,7 +249,6 @@ type ConnectionWrapper struct {
 	BaseWeight int
 }
 
-// TUNからパケットを読み出し -> 分割 -> ネットワークへ送信
 func tunToNetworkLoop(iface *water.Interface, conns []*ConnectionWrapper, fragSize int) {
 	packet := make([]byte, TunReadSize)
 
@@ -201,7 +289,6 @@ func tunToNetworkLoop(iface *water.Interface, conns []*ConnectionWrapper, fragSi
 	}
 }
 
-// ネットワークからパケット受信 -> 再構成 -> TUNへ書き込み
 func networkToTunLoop(iface *water.Interface, pktChan <-chan Packet) {
 	var nextSeqID int64 = 0
 	buffer := make(map[int64]Packet)
@@ -226,7 +313,7 @@ func networkToTunLoop(iface *water.Interface, pktChan <-chan Packet) {
 
 	for pkt := range pktChan {
 		if pkt.SeqID == 0 && nextSeqID != 0 {
-			log.Println("Detected Seq Reset. Resetting reassembly buffer.")
+			log.Println("Detected Seq Reset.")
 			nextSeqID = 0
 			buffer = make(map[int64]Packet)
 			ipPacketBuffer.Reset()
@@ -266,10 +353,8 @@ func runServer(iface *water.Interface, addr string, fragSize int) {
 	var clients []*ConnectionWrapper
 	var clientsMu sync.Mutex
 
-	// [Download方向] Network -> TUN -> Internet
 	go networkToTunLoop(iface, packetIngress)
 
-	// [Upload方向] Internet -> TUN -> Network (全クライアントへ)
 	go func() {
 		packet := make([]byte, TunReadSize)
 		for {
@@ -320,9 +405,11 @@ func runServer(iface *water.Interface, addr string, fragSize int) {
 
 		go func(c net.Conn) {
 			if err := serverHandshake(c); err != nil {
+				log.Printf("[Auth Failed] %v", err)
 				c.Close()
 				return
 			}
+			log.Printf("[Auth Success] Client verified: %s", c.RemoteAddr())
 
 			wrapper := &ConnectionWrapper{
 				Conn: c, Enc: gob.NewEncoder(c), Alive: true, BaseWeight: 10, RTT: 10 * time.Millisecond,
@@ -332,8 +419,6 @@ func runServer(iface *water.Interface, addr string, fragSize int) {
 			wrapper.ID = len(clients)
 			clients = append(clients, wrapper)
 			clientsMu.Unlock()
-
-			log.Printf("Client connected: %s", c.RemoteAddr())
 
 			dec := gob.NewDecoder(c)
 			for {
@@ -357,14 +442,27 @@ func runServer(iface *water.Interface, addr string, fragSize int) {
 	}
 }
 
+// サーバー側ハンドシェイク: 事前にロードした公開鍵で署名を検証
 func serverHandshake(conn net.Conn) error {
+	// 1. チャレンジ送信
 	challenge := make([]byte, ChallengeSize)
 	rand.Read(challenge)
-	conn.Write(challenge)
+	if _, err := conn.Write(challenge); err != nil {
+		return err
+	}
+
+	// 2. 署名受信
 	var msg HandshakeMsg
 	if err := gob.NewDecoder(conn).Decode(&msg); err != nil {
 		return err
 	}
+
+	// 3. 署名検証 (事前ロードした targetPubKey を使用)
+	hashed := sha256.Sum256(challenge)
+	if err := rsa.VerifyPKCS1v15(targetPubKey, crypto.SHA256, hashed[:], msg.Signature); err != nil {
+		return fmt.Errorf("signature verification failed: %v", err)
+	}
+	
 	return nil
 }
 
@@ -373,7 +471,6 @@ func serverHandshake(conn net.Conn) error {
 // ==========================================
 
 func runClient(iface *water.Interface, serverAddr string, numLines int, fragSize int, weightStr string, ifaceStr string) {
-	// 重み設定
 	manualWeights := make([]int, numLines)
 	wParts := strings.Split(weightStr, ",")
 	for i := 0; i < numLines; i++ {
@@ -383,14 +480,11 @@ func runClient(iface *water.Interface, serverAddr string, numLines int, fragSize
 		}
 	}
 
-	// インターフェース設定
 	bindIfaces := strings.Split(ifaceStr, ",")
-
 	conns := make([]*ConnectionWrapper, numLines)
 	packetIngress := make(chan Packet, 1000)
 
 	for i := 0; i < numLines; i++ {
-		// 特定のインターフェースにバインドするDialerを作成
 		dialer := net.Dialer{Timeout: 10 * time.Second}
 
 		if i < len(bindIfaces) && strings.TrimSpace(bindIfaces[i]) != "" {
@@ -411,6 +505,7 @@ func runClient(iface *water.Interface, serverAddr string, numLines int, fragSize
 		if err := clientHandshake(c); err != nil {
 			log.Fatalf("Handshake failed: %v", err)
 		}
+		log.Printf("[Line %d] Authenticated successfully.", i)
 
 		cw := &ConnectionWrapper{
 			ID: i, Conn: c, Enc: gob.NewEncoder(c),
@@ -418,7 +513,6 @@ func runClient(iface *water.Interface, serverAddr string, numLines int, fragSize
 		}
 		conns[i] = cw
 
-		// 受信ループ
 		go func(wrapper *ConnectionWrapper) {
 			dec := gob.NewDecoder(wrapper.Conn)
 			for {
@@ -439,7 +533,6 @@ func runClient(iface *water.Interface, serverAddr string, numLines int, fragSize
 			}
 		}(cw)
 
-		// Keepalive
 		go func(wrapper *ConnectionWrapper) {
 			tick := time.NewTicker(KeepAliveInterval)
 			for range tick.C {
@@ -460,7 +553,6 @@ func runClient(iface *water.Interface, serverAddr string, numLines int, fragSize
 	tunToNetworkLoop(iface, conns, fragSize)
 }
 
-// resolveInterfaceIP はインターフェース名からTCPAddrを解決します
 func resolveInterfaceIP(ifaceName string) (*net.TCPAddr, error) {
 	iface, err := net.InterfaceByName(ifaceName)
 	if err != nil {
@@ -470,8 +562,6 @@ func resolveInterfaceIP(ifaceName string) (*net.TCPAddr, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	// IPv4アドレスを優先して探す
 	for _, addr := range addrs {
 		if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
 			if ip4 := ipnet.IP.To4(); ip4 != nil {
@@ -479,23 +569,28 @@ func resolveInterfaceIP(ifaceName string) (*net.TCPAddr, error) {
 			}
 		}
 	}
-
 	return nil, fmt.Errorf("no valid IPv4 address found for interface %s", ifaceName)
 }
 
+// クライアント側ハンドシェイク: 事前にロードした秘密鍵で署名を作成
 func clientHandshake(conn net.Conn) error {
+	// 1. チャレンジ受信
 	buf := make([]byte, ChallengeSize)
-	io.ReadFull(conn, buf)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return err
+	}
+
+	// 2. 署名作成 (myPrivKeyを使用)
 	hashed := sha256.Sum256(buf)
-	sig, _ := rsa.SignPKCS1v15(rand.Reader, clientPrivKey, crypto.SHA256, hashed[:])
-	pub, _ := x509.MarshalPKIXPublicKey(&clientPrivKey.PublicKey)
-	msg := HandshakeMsg{PublicKey: pub, Signature: sig}
+	sig, err := rsa.SignPKCS1v15(rand.Reader, myPrivKey, crypto.SHA256, hashed[:])
+	if err != nil {
+		return err
+	}
+
+	// 3. 送信 (公開鍵は送らない)
+	msg := HandshakeMsg{Signature: sig}
 	return gob.NewEncoder(conn).Encode(msg)
 }
-
-// ==========================================
-// ユーティリティ
-// ==========================================
 
 func sendPacketWeighted(conns []*ConnectionWrapper, pkt Packet) {
 	type Candidate struct {
@@ -515,13 +610,11 @@ func sendPacketWeighted(conns []*ConnectionWrapper, pkt Packet) {
 		if !alive {
 			continue
 		}
-
 		ms := float64(rtt.Milliseconds())
 		if ms <= 0 {
 			ms = 1
 		}
 		score := float64(bw) * (100.0 / ms)
-
 		candidates = append(candidates, Candidate{c, score})
 		totalScore += score
 	}
