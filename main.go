@@ -29,7 +29,7 @@ import (
 // --- 設定・定数 ---
 
 const (
-	ProtocolVersion   = "BOND/4.2-DEBUG-FIX"
+	ProtocolVersion   = "BOND/4.3-SEQ-SYNC"
 	ChallengeSize     = 32
 	KeepAliveInterval = 10 * time.Second
 	TunReadSize       = 4096 // バッファサイズを拡大
@@ -270,6 +270,7 @@ func tunToNetworkLoop(iface *water.Interface, conns []*ConnectionWrapper, fragSi
 // Network -> TUN
 func networkToTunLoop(iface *water.Interface, pktChan <-chan Packet) {
 	var nextSeqID int64 = 0
+	var initialized bool = false // SeqID同期フラグ
 	buffer := make(map[int64]Packet)
 	var ipPacketBuffer bytes.Buffer
 	
@@ -299,6 +300,14 @@ func networkToTunLoop(iface *water.Interface, pktChan <-chan Packet) {
 			nextSeqID = 0
 			buffer = make(map[int64]Packet)
 			ipPacketBuffer.Reset()
+			initialized = true
+		}
+
+		// 初期化されていない場合、最初のパケットに同期する
+		if !initialized {
+			log.Printf("[INFO] Initializing SeqID from packet: %d", pkt.SeqID)
+			nextSeqID = pkt.SeqID
+			initialized = true
 		}
 
 		if pkt.SeqID == nextSeqID {
