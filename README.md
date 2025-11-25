@@ -32,6 +32,7 @@ sudo ./bonding -mode server -pub public.pem -vip 10.0.0.1/24 -addr :8080 -debug
 #sudo ./bonding -mode client -vip 10.0.0.2/24 -addr x.x.x.x:8080 -lines 2
 #sudo ./bonding -mode client -priv private.pem -addr x.x.x.x:8080 -lines 2 -ifaces "eth0,wlan0"
 sudo ./bonding -mode client -priv private.pem -vip 10.0.0.2/24 -addr (Server_IP):8080 -lines 2 -ifaces "(NIC_NAME1), (NIC_NAME2)" -redirect-gateway -gw "(GateWay1),(GateWay2)" -debug
+# -gwのオプションは一個だけにしておいた方が安定して動く
 
 # (別ターミナル) 特定の通信をTUN経由にするテスト
 ping 10.0.0.1
