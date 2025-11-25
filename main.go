@@ -18,10 +18,12 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"runtime"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/songgao/water"
@@ -30,7 +32,7 @@ import (
 // --- 設定・定数 ---
 
 const (
-	ProtocolVersion   = "BOND/4.4-AUTO-RECOVERY"
+	ProtocolVersion   = "BOND/4.5-ROUTING-AUTO"
 	ChallengeSize     = 32
 	KeepAliveInterval = 10 * time.Second
 	TunReadSize       = 4096 
@@ -80,6 +82,10 @@ func main() {
 	pubKeyFile := flag.String("pub", "public.pem", "Public key file path (Server mode)")
 	debug := flag.Bool("debug", false, "Enable verbose debug logging")
 
+	// ルーティング自動設定用のフラグ
+	redirectGw := flag.Bool("redirect-gateway", false, "Automatically redirect all traffic through the tunnel (Client only)")
+	gatewayIP := flag.String("gw", "", "Physical gateway IP (Required if -redirect-gateway is used)")
+
 	flag.Parse()
 	debugMode = *debug
 
@@ -113,6 +119,35 @@ func main() {
 	if *mode == "server" {
 		runServer(iface, *addr, *fragSize)
 	} else {
+		// ルーティング設定の適用（クライアントモードのみ）
+		if *redirectGw {
+			if *gatewayIP == "" {
+				log.Fatal("Error: -gw (physical gateway IP) is required when using -redirect-gateway. Check 'ip route show | grep default'.")
+			}
+			serverHost, _, err := net.SplitHostPort(*addr)
+			if err != nil {
+				// ポートがない場合などを考慮してそのまま使うかエラーにする
+				serverHost = *addr
+			}
+
+			// ルート設定適用
+			if err := setupRoutes(iface.Name(), serverHost, *gatewayIP); err != nil {
+				log.Printf("[WARN] Failed to setup routes: %v", err)
+			} else {
+				log.Println("[INFO] Routes configured. All traffic is redirected through tunnel.")
+				// 終了時のクリーンアップ登録
+				c := make(chan os.Signal, 1)
+				signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+				go func() {
+					<-c
+					log.Println("\n[INFO] Cleaning up routes and exiting...")
+					cleanupRoutes(iface.Name(), serverHost, *gatewayIP)
+					iface.Close()
+					os.Exit(0)
+				}()
+			}
+		}
+
 		runClient(iface, *addr, *lines, *fragSize, *weights, *ifaces)
 	}
 }
@@ -124,6 +159,53 @@ func debugLog(format string, v ...interface{}) {
 	if debugMode {
 		log.Printf("[DEBUG] "+format, v...)
 	}
+}
+
+// ==========================================
+// ルーティング設定 (Linux用)
+// ==========================================
+
+func setupRoutes(tunName, serverIP, gatewayIP string) error {
+	if runtime.GOOS != "linux" {
+		return fmt.Errorf("automatic routing is only supported on Linux")
+	}
+
+	// 1. VPNサーバーへの通信は、物理ゲートウェイを通るように固定（ループ防止）
+	// sudo ip route add <ServerIP> via <GatewayIP>
+	log.Printf("Adding static route to VPN Server %s via %s", serverIP, gatewayIP)
+	cmd := exec.Command("ip", "route", "add", serverIP, "via", gatewayIP)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		// すでに存在する場合もあるのでログだけ出して続行する場合も
+		return fmt.Errorf("failed to add server route: %v, %s", err, out)
+	}
+
+	// 2. デフォルトルートをTUNに向ける (0.0.0.0/1 と 128.0.0.0/1 で 0.0.0.0/0 をカバー)
+	// これにより既存のdefault routeを削除せずに上書きできる
+	log.Printf("Redirecting all traffic to %s", tunName)
+	
+	cmd = exec.Command("ip", "route", "add", "0.0.0.0/1", "dev", tunName)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		cleanupRoutes(tunName, serverIP, gatewayIP) // 失敗したら戻す
+		return fmt.Errorf("failed to add 0.0.0.0/1: %v, %s", err, out)
+	}
+
+	cmd = exec.Command("ip", "route", "add", "128.0.0.0/1", "dev", tunName)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		cleanupRoutes(tunName, serverIP, gatewayIP)
+		return fmt.Errorf("failed to add 128.0.0.0/1: %v, %s", err, out)
+	}
+
+	return nil
+}
+
+func cleanupRoutes(tunName, serverIP, gatewayIP string) {
+	if runtime.GOOS != "linux" { return }
+
+	log.Println("Restoring routing table...")
+	// エラーは無視して削除試行
+	exec.Command("ip", "route", "del", "0.0.0.0/1", "dev", tunName).Run()
+	exec.Command("ip", "route", "del", "128.0.0.0/1", "dev", tunName).Run()
+	exec.Command("ip", "route", "del", serverIP, "via", gatewayIP).Run()
 }
 
 // ==========================================
