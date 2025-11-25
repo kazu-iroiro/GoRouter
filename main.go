@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -29,10 +30,11 @@ import (
 // --- 設定・定数 ---
 
 const (
-	ProtocolVersion   = "BOND/4.3-SEQ-SYNC"
+	ProtocolVersion   = "BOND/4.4-AUTO-RECOVERY"
 	ChallengeSize     = 32
 	KeepAliveInterval = 10 * time.Second
-	TunReadSize       = 4096 // バッファサイズを拡大
+	TunReadSize       = 4096 
+	StallTimeout      = 1 * time.Second // パケット待ちのタイムアウト時間
 )
 
 // PacketType 定義
@@ -61,7 +63,7 @@ var (
 	globalSeqID    int64      
 	seqMu          sync.Mutex 
 	
-	debugMode      bool // デバッグフラグ
+	debugMode      bool
 )
 
 func main() {
@@ -80,8 +82,6 @@ func main() {
 
 	flag.Parse()
 	debugMode = *debug
-
-	// --- モード分岐 ---
 
 	if *mode == "keygen" {
 		if err := generateAndSaveKeys(); err != nil {
@@ -190,12 +190,10 @@ func setupTUN(cidr string, mtu int) (*water.Interface, error) {
 	time.Sleep(100 * time.Millisecond)
 
 	log.Printf("Configuring IP %s and MTU %d...", cidr, mtu)
-	// IP設定
 	cmd := exec.Command("ip", "addr", "add", cidr, "dev", iface.Name())
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("ip addr failed: %v, out: %s", err, out)
 	}
-	// リンクアップ & MTU
 	cmd = exec.Command("ip", "link", "set", "dev", iface.Name(), "mtu", fmt.Sprintf("%d", mtu), "up")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("ip link failed: %v, out: %s", err, out)
@@ -228,12 +226,10 @@ func tunToNetworkLoop(iface *water.Interface, conns []*ConnectionWrapper, fragSi
 		if err != nil {
 			log.Fatalf("TUN read error: %v", err)
 		}
-		debugLog("TUN Read: %d bytes", n)
-
+		
 		rawData := packet[:n]
 		offset := 0
 		
-		// SeqIDの発行（IPパケット単位ではなく、フラグメント単位で一意にする）
 		for offset < n {
 			end := offset + fragSize
 			isLast := false
@@ -258,80 +254,114 @@ func tunToNetworkLoop(iface *water.Interface, conns []*ConnectionWrapper, fragSi
 			}
 
 			if err := sendPacketWeighted(conns, pkt); err != nil {
-				debugLog("Failed to send packet Seq:%d: %v", currentSeq, err)
-			} else {
-				// debugLog("Sent Seq:%d Size:%d Fin:%v", currentSeq, len(chunk), isLast)
+				// 送信失敗ログ (このパケットは欠落し、受信側でGapとなる)
+				debugLog("Drop/Fail Seq:%d: %v", currentSeq, err)
 			}
 			offset = end
 		}
 	}
 }
 
-// Network -> TUN
+// Network -> TUN (Timeoutによる自動復旧機能付き)
 func networkToTunLoop(iface *water.Interface, pktChan <-chan Packet) {
 	var nextSeqID int64 = 0
-	var initialized bool = false // SeqID同期フラグ
+	var initialized bool = false
 	buffer := make(map[int64]Packet)
 	var ipPacketBuffer bytes.Buffer
 	
 	log.Println("Started Network Reassembler Loop")
 
+	// パケット処理関数
 	processPacket := func(pkt Packet) {
 		if pkt.Type != TypeData { return }
-
 		ipPacketBuffer.Write(pkt.Payload)
-
 		if pkt.IsFin {
 			data := ipPacketBuffer.Bytes()
-			n, err := iface.Write(data)
-			if err != nil {
+			if _, err := iface.Write(data); err != nil {
 				log.Printf("TUN write error: %v", err)
 			} else {
-				debugLog("TUN Write: %d bytes (Original Seq:%d)", n, pkt.SeqID)
+				debugLog("TUN Write: %d bytes (Seq:%d)", len(data), pkt.SeqID)
 			}
 			ipPacketBuffer.Reset()
 		}
 	}
 
-	for pkt := range pktChan {
-		// リセット検出: SeqID=0 が飛んできたら強制リセット
-		if pkt.SeqID == 0 {
-			log.Println("[INFO] SeqID Reset detected (Seq=0). Clearing buffers.")
-			nextSeqID = 0
-			buffer = make(map[int64]Packet)
-			ipPacketBuffer.Reset()
-			initialized = true
-		}
+	// タイムアウト監視用のTicker
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	lastProgressTime := time.Now()
 
-		// 初期化されていない場合、最初のパケットに同期する
-		if !initialized {
-			log.Printf("[INFO] Initializing SeqID from packet: %d", pkt.SeqID)
-			nextSeqID = pkt.SeqID
-			initialized = true
-		}
+	for {
+		select {
+		case pkt := <-pktChan:
+			lastProgressTime = time.Now()
 
-		if pkt.SeqID == nextSeqID {
-			// 期待通りの順番
-			processPacket(pkt)
-			nextSeqID++
+			// リセット検出
+			if pkt.SeqID == 0 {
+				log.Println("[INFO] SeqID Reset detected. Clearing.")
+				nextSeqID = 0
+				buffer = make(map[int64]Packet)
+				ipPacketBuffer.Reset()
+				initialized = true
+			}
 
-			// バッファ内の後続パケットを処理
-			for {
-				if nextPkt, ok := buffer[nextSeqID]; ok {
-					delete(buffer, nextSeqID)
-					processPacket(nextPkt)
-					nextSeqID++
-				} else {
-					break
+			if !initialized {
+				log.Printf("[INFO] Initializing SeqID: %d", pkt.SeqID)
+				nextSeqID = pkt.SeqID
+				initialized = true
+			}
+
+			if pkt.SeqID == nextSeqID {
+				processPacket(pkt)
+				nextSeqID++
+				// バッファ消化
+				for {
+					if nextPkt, ok := buffer[nextSeqID]; ok {
+						delete(buffer, nextSeqID)
+						processPacket(nextPkt)
+						nextSeqID++
+					} else {
+						break
+					}
+				}
+			} else if pkt.SeqID > nextSeqID {
+				debugLog("Buffered Seq:%d (Want %d)", pkt.SeqID, nextSeqID)
+				buffer[pkt.SeqID] = pkt
+			}
+			// 古いパケットは無視
+
+		case <-ticker.C:
+			// スタック検知：バッファに未来のパケットがあるのに、現在待ちのSeqIDが来ない
+			if len(buffer) > 0 && time.Since(lastProgressTime) > StallTimeout {
+				// バッファ内で最小のSeqIDを探す
+				var minBufferedSeq int64 = -1
+				var keys []int64
+				for k := range buffer { keys = append(keys, k) }
+				sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+				
+				if len(keys) > 0 {
+					minBufferedSeq = keys[0]
+				}
+
+				if minBufferedSeq != -1 && minBufferedSeq > nextSeqID {
+					log.Printf("[WARN] Stall detected! Skipping missing packets %d -> %d", nextSeqID, minBufferedSeq)
+					// 強制スキップ。組み立て中のバッファは壊れているので破棄
+					ipPacketBuffer.Reset()
+					nextSeqID = minBufferedSeq
+					lastProgressTime = time.Now() // タイマーリセット
+					
+					// スキップ先にバッファがあれば処理再開
+					for {
+						if nextPkt, ok := buffer[nextSeqID]; ok {
+							delete(buffer, nextSeqID)
+							processPacket(nextPkt)
+							nextSeqID++
+						} else {
+							break
+						}
+					}
 				}
 			}
-		} else if pkt.SeqID > nextSeqID {
-			// 未来のパケット -> バッファへ
-			debugLog("Buffered Seq:%d (Waiting for %d)", pkt.SeqID, nextSeqID)
-			buffer[pkt.SeqID] = pkt
-		} else {
-			// 過去のパケット -> 無視
-			debugLog("Dropped duplicate/old Seq:%d (Current: %d)", pkt.SeqID, nextSeqID)
 		}
 	}
 }
@@ -349,16 +379,13 @@ func runServer(iface *water.Interface, addr string, fragSize int) {
 	var clients []*ConnectionWrapper
 	var clientsMu sync.Mutex
 
-	// ダウンロード方向: Network -> TUN
 	go networkToTunLoop(iface, packetIngress)
 
-	// アップロード方向: TUN -> Network (全クライアントへ)
 	go func() {
 		packet := make([]byte, TunReadSize)
 		for {
 			n, err := iface.Read(packet)
 			if err != nil { log.Fatal(err) }
-			debugLog("Server TUN Read: %d bytes", n)
 			
 			rawData := packet[:n]
 			offset := 0
@@ -375,12 +402,7 @@ func runServer(iface *water.Interface, addr string, fragSize int) {
 				globalSeqID++
 				seqMu.Unlock()
 
-				pkt := Packet{
-					Type:    TypeData,
-					SeqID:   currentSeq,
-					Payload: chunk,
-					IsFin:   isLast,
-				}
+				pkt := Packet{Type: TypeData, SeqID: currentSeq, Payload: chunk, IsFin: isLast}
 
 				clientsMu.Lock()
 				if len(clients) > 0 {
@@ -419,20 +441,15 @@ func runServer(iface *water.Interface, addr string, fragSize int) {
 				var pkt Packet
 				if err := dec.Decode(&pkt); err != nil {
 					log.Printf("Client disconnected: %v", err)
-					wrapper.Mu.Lock()
-					wrapper.Alive = false
-					wrapper.Mu.Unlock()
+					wrapper.Mu.Lock(); wrapper.Alive = false; wrapper.Mu.Unlock()
 					return
 				}
 				if pkt.Type == TypePing {
 					go func(p Packet) {
 						pong := Packet{Type: TypePong, Timestamp: p.Timestamp}
-						wrapper.Mu.Lock()
-						wrapper.Enc.Encode(pong)
-						wrapper.Mu.Unlock()
+						wrapper.Mu.Lock(); wrapper.Enc.Encode(pong); wrapper.Mu.Unlock()
 					}(pkt)
 				} else {
-					// debugLog("Recv Seq:%d", pkt.SeqID)
 					packetIngress <- pkt
 				}
 			}
