@@ -32,7 +32,7 @@ import (
 // --- 設定・定数 ---
 
 const (
-	ProtocolVersion   = "BOND/4.6-ROUTING-FIX"
+	ProtocolVersion   = "BOND/4.14-AUTO-LINES"
 	ChallengeSize     = 32
 	KeepAliveInterval = 10 * time.Second
 	TunReadSize       = 4096 
@@ -84,10 +84,28 @@ func main() {
 
 	// ルーティング自動設定用のフラグ
 	redirectGw := flag.Bool("redirect-gateway", false, "Automatically redirect all traffic through the tunnel (Client only)")
-	gatewayIP := flag.String("gw", "", "Physical gateway IP (Required if -redirect-gateway is used)")
+	gatewayIP := flag.String("gw", "", "Physical gateway IPs comma separated (Required if -redirect-gateway is used)")
+	routerMode := flag.Bool("router", false, "Enable IP forwarding and NAT to act as a gateway for LAN devices (Client only)")
 
 	flag.Parse()
 	debugMode = *debug
+
+	// --- 接続数の自動調整ロジック ---
+	if *mode == "client" && *ifaces != "" {
+		// カンマ区切りでインターフェース数をカウント
+		count := 0
+		for _, iface := range strings.Split(*ifaces, ",") {
+			if strings.TrimSpace(iface) != "" {
+				count++
+			}
+		}
+		// 指定されたインターフェース数が -lines より多い場合、自動的に増やす
+		if count > *lines {
+			log.Printf("[Config] Auto-adjusting connection lines: %d -> %d (matched to -ifaces)", *lines, count)
+			*lines = count
+		}
+	}
+	// -----------------------------
 
 	if *mode == "keygen" {
 		if err := generateAndSaveKeys(); err != nil {
@@ -119,36 +137,61 @@ func main() {
 	if *mode == "server" {
 		runServer(iface, *addr, *fragSize)
 	} else {
-		// ルーティング設定の適用（クライアントモードのみ）
-		if *redirectGw {
-			if *gatewayIP == "" {
-				log.Fatal("Error: -gw (physical gateway IP) is required when using -redirect-gateway. Check 'ip route show | grep default'.")
-			}
-			serverHost, _, err := net.SplitHostPort(*addr)
-			if err != nil {
-				// ポートがない場合などを考慮してそのまま使うかエラーにする
-				serverHost = *addr
-			}
-
-			// ルート設定適用
-			if err := setupRoutes(iface.Name(), serverHost, *gatewayIP); err != nil {
-				log.Printf("[WARN] Failed to setup routes: %v", err)
+		// ルーティング・ルーター設定の適用（クライアントモードのみ）
+		var cleanupFunc func() // クリーンアップ関数を保持
+		
+		// ルーターモード設定 (IP Forwarding + NAT)
+		if *routerMode {
+			if err := setupRouterMode(iface.Name()); err != nil {
+				log.Printf("[WARN] Failed to setup router mode: %v", err)
 			} else {
-				log.Println("[INFO] Routes configured. All traffic is redirected through tunnel.")
-				// 終了時のクリーンアップ登録
-				c := make(chan os.Signal, 1)
-				signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-				go func() {
-					<-c
-					log.Println("\n[INFO] Cleaning up routes and exiting...")
-					cleanupRoutes(iface.Name(), serverHost, *gatewayIP)
-					iface.Close()
-					os.Exit(0)
-				}()
+				log.Println("[INFO] Router mode enabled (IP Forwarding + NAT). This device can now act as a gateway.")
 			}
 		}
 
-		runClient(iface, *addr, *lines, *fragSize, *weights, *ifaces)
+		if *redirectGw {
+			if *gatewayIP == "" {
+				log.Fatal("Error: -gw (physical gateway IP) is required when using -redirect-gateway. Use comma for multiple gateways.")
+			}
+			serverHost, _, err := net.SplitHostPort(*addr)
+			if err != nil {
+				serverHost = *addr
+			}
+
+			gateways := strings.Split(*gatewayIP, ",")
+			bindIfacesList := strings.Split(*ifaces, ",")
+			for i := range gateways { gateways[i] = strings.TrimSpace(gateways[i]) }
+			for i := range bindIfacesList { bindIfacesList[i] = strings.TrimSpace(bindIfacesList[i]) }
+
+			// クリーンアップ関数定義
+			cleanupFunc = func() {
+				log.Println("\n[INFO] Cleaning up routes and firewall rules...")
+				cleanupRoutes(iface.Name(), serverHost, gateways, bindIfacesList)
+				if *routerMode {
+					cleanupRouterMode(iface.Name())
+				}
+				iface.Close()
+			}
+
+			// ルート設定適用
+			if err := setupRoutes(iface.Name(), serverHost, gateways, bindIfacesList); err != nil {
+				log.Printf("[WARN] Failed to setup routes: %v", err)
+			} else {
+				log.Println("[INFO] Routes configured. All traffic is redirected through tunnel.")
+			}
+			
+			// シグナルハンドリング
+			c := make(chan os.Signal, 1)
+			signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+			go func() {
+				<-c
+				if cleanupFunc != nil { cleanupFunc() }
+				os.Exit(0)
+			}()
+		}
+
+		// クライアント実行
+		runClient(iface, *addr, *lines, *fragSize, *weights, *ifaces, cleanupFunc)
 	}
 }
 
@@ -162,54 +205,149 @@ func debugLog(format string, v ...interface{}) {
 }
 
 // ==========================================
-// ルーティング設定 (Linux用)
+// ルーターモード設定 (IP Forwarding & NAT)
 // ==========================================
 
-func setupRoutes(tunName, serverIP, gatewayIP string) error {
+func setupRouterMode(tunName string) error {
+	if runtime.GOOS != "linux" {
+		return fmt.Errorf("router mode is only supported on Linux")
+	}
+
+	// 1. IP Forwarding 有効化
+	log.Println("Enabling IP Forwarding...")
+	cmd := exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to enable ip_forward: %v, %s", err, out)
+	}
+
+	// 2. TUNインターフェースでのNAT (Masquerade) 設定
+	// これにより、下流からのパケットがTUNのIPとして送信される
+	log.Printf("Enabling NAT (Masquerade) on %s...", tunName)
+	cmd = exec.Command("iptables", "-t", "nat", "-A", "POSTROUTING", "-o", tunName, "-j", "MASQUERADE")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to setup iptables NAT: %v, %s", err, out)
+	}
+
+	// 3. FORWARD チェーンの許可 (念のため)
+	// 下流 -> TUN
+	exec.Command("iptables", "-A", "FORWARD", "-o", tunName, "-j", "ACCEPT").Run()
+	// TUN -> 下流 (確立済み接続)
+	exec.Command("iptables", "-A", "FORWARD", "-i", tunName, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT").Run()
+
+	return nil
+}
+
+func cleanupRouterMode(tunName string) {
+	if runtime.GOOS != "linux" { return }
+	log.Println("Disabling NAT and IP Forwarding...")
+	
+	// NAT削除
+	exec.Command("iptables", "-t", "nat", "-D", "POSTROUTING", "-o", tunName, "-j", "MASQUERADE").Run()
+	exec.Command("iptables", "-D", "FORWARD", "-o", tunName, "-j", "ACCEPT").Run()
+	exec.Command("iptables", "-D", "FORWARD", "-i", tunName, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT").Run()
+	
+	// IP Forwarding は他の影響を考慮して戻さないのが一般的だが、ここでは戻さないでおく
+	// exec.Command("sysctl", "-w", "net.ipv4.ip_forward=0").Run()
+}
+
+// ==========================================
+// ルーティング設定 (Linux Policy Routing)
+// ==========================================
+
+func setupRoutes(tunName, serverIP string, gatewayIPs []string, bindIfaces []string) error {
 	if runtime.GOOS != "linux" {
 		return fmt.Errorf("automatic routing is only supported on Linux")
 	}
 
-	// 1. VPNサーバーへの通信は、物理ゲートウェイを通るように固定（ループ防止）
-	// 既存の設定があるかもしれないので、削除を試みてから追加する（強制上書き）
-	log.Printf("Configuring route to VPN Server %s via %s", serverIP, gatewayIP)
-	exec.Command("ip", "route", "del", serverIP).Run() // 失敗しても無視
+	// 1. Policy Routing
+	startTableID := 201
 
-	cmd := exec.Command("ip", "route", "add", serverIP, "via", gatewayIP)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("failed to add server route: %v, %s", err, out)
+	for i, gw := range gatewayIPs {
+		if i >= len(bindIfaces) || bindIfaces[i] == "" { continue }
+		ifName := bindIfaces[i]
+		tableID := fmt.Sprintf("%d", startTableID + i)
+
+		localAddr, err := resolveInterfaceIP(ifName)
+		if err != nil {
+			return fmt.Errorf("failed to resolve IP for %s: %v", ifName, err)
+		}
+		srcIP := localAddr.IP.String()
+
+		if srcIP == gw {
+			return fmt.Errorf("invalid configuration: Gateway IP (%s) matches Interface IP (%s).", gw, srcIP)
+		}
+
+		log.Printf("Setting up policy routing for %s (IP: %s, GW: %s, Table: %s)", ifName, srcIP, gw, tableID)
+
+		exec.Command("ip", "rule", "del", "from", srcIP, "table", tableID).Run()
+		cmd := exec.Command("ip", "rule", "add", "from", srcIP, "table", tableID, "prio", "100")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("rule add failed: %v, %s", err, out)
+		}
+
+		exec.Command("ip", "route", "del", serverIP, "table", tableID).Run()
+		cmd = exec.Command("ip", "route", "add", serverIP, "via", gw, "dev", ifName, "table", tableID, "onlink")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			if !strings.Contains(string(out), "File exists") {
+				return fmt.Errorf("route add table failed: %v, %s", err, out)
+			}
+		}
 	}
 
-	// 2. デフォルトルートをTUNに向ける (0.0.0.0/1 と 128.0.0.0/1 で 0.0.0.0/0 をカバー)
-	log.Printf("Redirecting all traffic to %s", tunName)
+	// 2. メインテーブルへのフォールバックルート追加
+	if len(gatewayIPs) > 0 && len(bindIfaces) > 0 {
+		fallbackGW := gatewayIPs[0]
+		log.Printf("Adding fallback route to VPN Server %s via %s (Main Table)", serverIP, fallbackGW)
+		
+		exec.Command("ip", "route", "del", serverIP).Run()
+		cmd := exec.Command("ip", "route", "add", serverIP, "via", fallbackGW)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			if !strings.Contains(string(out), "File exists") {
+				log.Printf("[WARN] Failed to add fallback route to main table: %v", err)
+			}
+		}
+	}
+
+	// 3. デフォルトルートをTUNに向ける
+	log.Printf("Redirecting all traffic to %s (Main Table)", tunName)
 	
-	// 0.0.0.0/1
 	exec.Command("ip", "route", "del", "0.0.0.0/1").Run()
-	cmd = exec.Command("ip", "route", "add", "0.0.0.0/1", "dev", tunName)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		cleanupRoutes(tunName, serverIP, gatewayIP)
+	if out, err := exec.Command("ip", "route", "add", "0.0.0.0/1", "dev", tunName).CombinedOutput(); err != nil {
+		cleanupRoutes(tunName, serverIP, gatewayIPs, bindIfaces)
 		return fmt.Errorf("failed to add 0.0.0.0/1: %v, %s", err, out)
 	}
 
-	// 128.0.0.0/1
 	exec.Command("ip", "route", "del", "128.0.0.0/1").Run()
-	cmd = exec.Command("ip", "route", "add", "128.0.0.0/1", "dev", tunName)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		cleanupRoutes(tunName, serverIP, gatewayIP)
+	if out, err := exec.Command("ip", "route", "add", "128.0.0.0/1", "dev", tunName).CombinedOutput(); err != nil {
+		cleanupRoutes(tunName, serverIP, gatewayIPs, bindIfaces)
 		return fmt.Errorf("failed to add 128.0.0.0/1: %v, %s", err, out)
 	}
 
 	return nil
 }
 
-func cleanupRoutes(tunName, serverIP, gatewayIP string) {
+func cleanupRoutes(tunName, serverIP string, gatewayIPs []string, bindIfaces []string) {
 	if runtime.GOOS != "linux" { return }
 
 	log.Println("Restoring routing table...")
-	// エラーは無視して削除試行
 	exec.Command("ip", "route", "del", "0.0.0.0/1", "dev", tunName).Run()
 	exec.Command("ip", "route", "del", "128.0.0.0/1", "dev", tunName).Run()
-	exec.Command("ip", "route", "del", serverIP, "via", gatewayIP).Run()
+	exec.Command("ip", "route", "del", serverIP).Run()
+
+	startTableID := 201
+	for i, _ := range gatewayIPs {
+		if i >= len(bindIfaces) || bindIfaces[i] == "" { continue }
+		ifName := bindIfaces[i]
+		tableID := fmt.Sprintf("%d", startTableID + i)
+		
+		localAddr, err := resolveInterfaceIP(ifName)
+		if err == nil {
+			srcIP := localAddr.IP.String()
+			exec.Command("ip", "rule", "del", "from", srcIP, "table", tableID).Run()
+		}
+		exec.Command("ip", "route", "del", serverIP, "table", tableID).Run()
+		exec.Command("ip", "route", "flush", "table", tableID).Run()
+	}
 }
 
 // ==========================================
@@ -340,7 +478,6 @@ func tunToNetworkLoop(iface *water.Interface, conns []*ConnectionWrapper, fragSi
 			}
 
 			if err := sendPacketWeighted(conns, pkt); err != nil {
-				// 送信失敗ログ (このパケットは欠落し、受信側でGapとなる)
 				debugLog("Drop/Fail Seq:%d: %v", currentSeq, err)
 			}
 			offset = end
@@ -565,7 +702,8 @@ func serverHandshake(conn net.Conn) error {
 // クライアント側
 // ==========================================
 
-func runClient(iface *water.Interface, serverAddr string, numLines int, fragSize int, weightStr string, ifaceStr string) {
+// cleanupFunc引数を追加
+func runClient(iface *water.Interface, serverAddr string, numLines int, fragSize int, weightStr string, ifaceStr string, cleanupFunc func()) {
 	manualWeights := make([]int, numLines)
 	wParts := strings.Split(weightStr, ",")
 	for i := 0; i < numLines; i++ {
@@ -576,24 +714,36 @@ func runClient(iface *water.Interface, serverAddr string, numLines int, fragSize
 	bindIfaces := strings.Split(ifaceStr, ",")
 	conns := make([]*ConnectionWrapper, numLines)
 	packetIngress := make(chan Packet, 1000)
+	
+	successCount := 0
 
 	for i := 0; i < numLines; i++ {
-		dialer := net.Dialer{Timeout: 10 * time.Second}
+		dialer := net.Dialer{Timeout: 5 * time.Second} // タイムアウトを少し短く
 		if i < len(bindIfaces) && strings.TrimSpace(bindIfaces[i]) != "" {
 			targetIface := strings.TrimSpace(bindIfaces[i])
 			if localAddr, err := resolveInterfaceIP(targetIface); err == nil {
 				dialer.LocalAddr = localAddr
 				log.Printf("[Line %d] Bind: %s (%s)", i, targetIface, localAddr.String())
 			} else {
-				log.Fatalf("Bind error: %v", err)
+				log.Printf("[Line %d] Bind Error: %v (Trying default)", i, err)
 			}
 		}
 
 		c, err := dialer.Dial("tcp", serverAddr)
-		if err != nil { log.Fatalf("Dial failed: %v", err) }
+		if err != nil {
+			// エラーでも続行 (Robust Dialing)
+			log.Printf("[Line %d] Connect Failed: %v", i, err)
+			continue 
+		}
 
-		if err := clientHandshake(c); err != nil { log.Fatalf("Handshake failed: %v", err) }
+		if err := clientHandshake(c); err != nil { 
+			log.Printf("[Line %d] Handshake Failed: %v", i, err)
+			c.Close()
+			continue
+		}
+		
 		log.Printf("[Line %d] Connected.", i)
+		successCount++
 
 		cw := &ConnectionWrapper{
 			ID: i, Conn: c, Enc: gob.NewEncoder(c), Alive: true, BaseWeight: manualWeights[i], RTT: 100 * time.Millisecond,
@@ -625,6 +775,13 @@ func runClient(iface *water.Interface, serverAddr string, numLines int, fragSize
 				w.Mu.Lock(); w.Enc.Encode(p); w.Mu.Unlock()
 			}
 		}(cw)
+	}
+
+	// 全回線失敗なら終了
+	if successCount == 0 {
+		log.Println("All connections failed. Exiting.")
+		if cleanupFunc != nil { cleanupFunc() }
+		os.Exit(1)
 	}
 
 	go networkToTunLoop(iface, packetIngress)
@@ -663,6 +820,7 @@ func sendPacketWeighted(conns []*ConnectionWrapper, pkt Packet) error {
 	var totalScore float64
 
 	for _, c := range conns {
+		if c == nil { continue } // 接続失敗したLineはnilの可能性あり
 		c.Mu.Lock()
 		alive := c.Alive
 		rtt := c.RTT
@@ -694,7 +852,6 @@ func sendPacketWeighted(conns []*ConnectionWrapper, pkt Packet) error {
 	err := target.Enc.Encode(pkt)
 	target.Mu.Unlock()
 
-	// 成功した場合、デバッグログに使用した回線IDを出力
 	if err == nil {
 		debugLog("Sent Seq:%d Size:%d via Line %d", pkt.SeqID, len(pkt.Payload), target.ID)
 	}
