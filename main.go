@@ -32,7 +32,7 @@ import (
 // --- 設定・定数 ---
 
 const (
-	ProtocolVersion   = "BOND/4.6-ROUTING-FIX"
+	ProtocolVersion   = "BOND/4.8-MULTIPATH-GW"
 	ChallengeSize     = 32
 	KeepAliveInterval = 10 * time.Second
 	TunReadSize       = 4096 
@@ -84,7 +84,7 @@ func main() {
 
 	// ルーティング自動設定用のフラグ
 	redirectGw := flag.Bool("redirect-gateway", false, "Automatically redirect all traffic through the tunnel (Client only)")
-	gatewayIP := flag.String("gw", "", "Physical gateway IP (Required if -redirect-gateway is used)")
+	gatewayIP := flag.String("gw", "", "Physical gateway IPs comma separated (Required if -redirect-gateway is used)")
 
 	flag.Parse()
 	debugMode = *debug
@@ -122,16 +122,21 @@ func main() {
 		// ルーティング設定の適用（クライアントモードのみ）
 		if *redirectGw {
 			if *gatewayIP == "" {
-				log.Fatal("Error: -gw (physical gateway IP) is required when using -redirect-gateway. Check 'ip route show | grep default'.")
+				log.Fatal("Error: -gw (physical gateway IP) is required when using -redirect-gateway. Use comma for multiple gateways.")
 			}
 			serverHost, _, err := net.SplitHostPort(*addr)
 			if err != nil {
-				// ポートがない場合などを考慮してそのまま使うかエラーにする
 				serverHost = *addr
 			}
 
+			// カンマ区切りをパース
+			gateways := strings.Split(*gatewayIP, ",")
+			bindIfacesList := strings.Split(*ifaces, ",")
+			for i := range gateways { gateways[i] = strings.TrimSpace(gateways[i]) }
+			for i := range bindIfacesList { bindIfacesList[i] = strings.TrimSpace(bindIfacesList[i]) }
+
 			// ルート設定適用
-			if err := setupRoutes(iface.Name(), serverHost, *gatewayIP); err != nil {
+			if err := setupRoutes(iface.Name(), serverHost, gateways, bindIfacesList); err != nil {
 				log.Printf("[WARN] Failed to setup routes: %v", err)
 			} else {
 				log.Println("[INFO] Routes configured. All traffic is redirected through tunnel.")
@@ -141,7 +146,7 @@ func main() {
 				go func() {
 					<-c
 					log.Println("\n[INFO] Cleaning up routes and exiting...")
-					cleanupRoutes(iface.Name(), serverHost, *gatewayIP)
+					cleanupRoutes(iface.Name(), serverHost, gateways)
 					iface.Close()
 					os.Exit(0)
 				}()
@@ -165,19 +170,50 @@ func debugLog(format string, v ...interface{}) {
 // ルーティング設定 (Linux用)
 // ==========================================
 
-func setupRoutes(tunName, serverIP, gatewayIP string) error {
+func setupRoutes(tunName, serverIP string, gatewayIPs []string, bindIfaces []string) error {
 	if runtime.GOOS != "linux" {
 		return fmt.Errorf("automatic routing is only supported on Linux")
 	}
 
 	// 1. VPNサーバーへの通信は、物理ゲートウェイを通るように固定（ループ防止）
-	// 既存の設定があるかもしれないので、削除を試みてから追加する（強制上書き）
-	log.Printf("Configuring route to VPN Server %s via %s", serverIP, gatewayIP)
-	exec.Command("ip", "route", "del", serverIP).Run() // 失敗しても無視
+	// 既存の設定削除
+	exec.Command("ip", "route", "del", serverIP).Run()
 
-	cmd := exec.Command("ip", "route", "add", serverIP, "via", gatewayIP)
+	var cmd *exec.Cmd
+	if len(gatewayIPs) == 1 {
+		// シングルゲートウェイ
+		log.Printf("Configuring route to VPN Server %s via %s", serverIP, gatewayIPs[0])
+		cmd = exec.Command("ip", "route", "add", serverIP, "via", gatewayIPs[0])
+	} else {
+		// マルチゲートウェイ (NexthopによるECMP設定)
+		// ip route add <ServerIP> nexthop via <GW1> dev <IF1> weight 1 nexthop via <GW2> dev <IF2> weight 1
+		args := []string{"route", "add", serverIP}
+		logMsg := fmt.Sprintf("Configuring multipath route to VPN Server %s via:", serverIP)
+		
+		for i, gw := range gatewayIPs {
+			logMsg += fmt.Sprintf(" [GW:%s", gw)
+			args = append(args, "nexthop", "via", gw)
+			
+			// 対応するインターフェースがあれば指定
+			if i < len(bindIfaces) && bindIfaces[i] != "" {
+				args = append(args, "dev", bindIfaces[i])
+				logMsg += fmt.Sprintf(" dev:%s]", bindIfaces[i])
+			} else {
+				logMsg += "]"
+			}
+			args = append(args, "weight", "1")
+		}
+		log.Println(logMsg)
+		cmd = exec.Command("ip", args...)
+	}
+
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("failed to add server route: %v, %s", err, out)
+		// 既に存在するなどのエラーは許容する場合もあるが、設定が間違っている可能性が高いのでエラーを返す
+		if strings.Contains(string(out), "File exists") {
+			log.Printf("[INFO] Route to server already exists. Skipping.")
+		} else {
+			return fmt.Errorf("failed to add server route: %v, %s", err, out)
+		}
 	}
 
 	// 2. デフォルトルートをTUNに向ける (0.0.0.0/1 と 128.0.0.0/1 で 0.0.0.0/0 をカバー)
@@ -187,29 +223,38 @@ func setupRoutes(tunName, serverIP, gatewayIP string) error {
 	exec.Command("ip", "route", "del", "0.0.0.0/1").Run()
 	cmd = exec.Command("ip", "route", "add", "0.0.0.0/1", "dev", tunName)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		cleanupRoutes(tunName, serverIP, gatewayIP)
-		return fmt.Errorf("failed to add 0.0.0.0/1: %v, %s", err, out)
+		if strings.Contains(string(out), "File exists") {
+			log.Printf("[INFO] Route 0.0.0.0/1 already exists. Skipping.")
+		} else {
+			cleanupRoutes(tunName, serverIP, gatewayIPs)
+			return fmt.Errorf("failed to add 0.0.0.0/1: %v, %s", err, out)
+		}
 	}
 
 	// 128.0.0.0/1
 	exec.Command("ip", "route", "del", "128.0.0.0/1").Run()
 	cmd = exec.Command("ip", "route", "add", "128.0.0.0/1", "dev", tunName)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		cleanupRoutes(tunName, serverIP, gatewayIP)
-		return fmt.Errorf("failed to add 128.0.0.0/1: %v, %s", err, out)
+		if strings.Contains(string(out), "File exists") {
+			log.Printf("[INFO] Route 128.0.0.0/1 already exists. Skipping.")
+		} else {
+			cleanupRoutes(tunName, serverIP, gatewayIPs)
+			return fmt.Errorf("failed to add 128.0.0.0/1: %v, %s", err, out)
+		}
 	}
 
 	return nil
 }
 
-func cleanupRoutes(tunName, serverIP, gatewayIP string) {
+func cleanupRoutes(tunName, serverIP string, gatewayIPs []string) {
 	if runtime.GOOS != "linux" { return }
 
 	log.Println("Restoring routing table...")
-	// エラーは無視して削除試行
 	exec.Command("ip", "route", "del", "0.0.0.0/1", "dev", tunName).Run()
 	exec.Command("ip", "route", "del", "128.0.0.0/1", "dev", tunName).Run()
-	exec.Command("ip", "route", "del", serverIP, "via", gatewayIP).Run()
+	
+	// サーバーへのルート削除（nexthop設定でも宛先指定削除で消えるはず）
+	exec.Command("ip", "route", "del", serverIP).Run()
 }
 
 // ==========================================
