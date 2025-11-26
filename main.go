@@ -37,6 +37,10 @@ const (
 	KeepAliveInterval = 10 * time.Second
 	TunReadSize       = 4096 
 	StallTimeout      = 1 * time.Second // パケット待ちのタイムアウト時間
+
+	// SeqIDの上限
+	// math.MaxInt64 = 9223372036854775807
+	MaxSeqID          = math.MaxInt64 
 )
 
 // PacketType 定義
@@ -466,9 +470,16 @@ func tunToNetworkLoop(iface *water.Interface, conns []*ConnectionWrapper, fragSi
 			copy(chunk, rawData[offset:end])
 
 			seqMu.Lock()
+			// --- SeqID Wrap-around Logic ---
+			if globalSeqID == MaxSeqID {
+				globalSeqID = 0
+				log.Println("[INFO] SeqID reached limit. Wrapping around to 0.")
+			} else {
+				globalSeqID++
+			}
 			currentSeq := globalSeqID
-			globalSeqID++
 			seqMu.Unlock()
+			// -------------------------------
 
 			pkt := Packet{
 				Type:    TypeData,
