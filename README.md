@@ -31,6 +31,10 @@ sudo ./bonding -mode server -pub public.pem -vip 10.0.0.1/24 -addr :8080 -debug
 # プログラム起動 (サーバーへ接続)
 #sudo ./bonding -mode client -vip 10.0.0.2/24 -addr x.x.x.x:8080 -lines 2
 #sudo ./bonding -mode client -priv private.pem -addr x.x.x.x:8080 -lines 2 -ifaces "eth0,wlan0"
+
+ifconfig # (NIC_NAME1), (NIC_NAME2)にあたるIPアドレスの取得
+ip route list # (GateWay1), (GateWay2)にあたるIPアドレスの取得
+
 sudo ./bonding -mode client -priv private.pem -vip 10.0.0.2/24 -addr (Server_IP):8080 -lines 2 -ifaces "(NIC_NAME1), (NIC_NAME2)" -redirect-gateway -gw "(GateWay1),(GateWay2)" -debug
 # -gwのオプションは一個だけにしておいた方が安定して動く
 
