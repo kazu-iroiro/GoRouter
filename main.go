@@ -36,7 +36,7 @@ const (
 	ProtocolVersion   = "BOND/4.14-AUTO-LINES"
 	ChallengeSize     = 32
 	KeepAliveInterval = 10 * time.Second
-	TunReadSize       = 4096 
+	TunReadSize       = 65535 
 	StallTimeout      = 1 * time.Second // パケット待ちのタイムアウト時間
 
 	// SeqIDの上限
@@ -77,8 +77,8 @@ func main() {
 	mode := flag.String("mode", "server", "Mode: server, client, or keygen")
 	addr := flag.String("addr", "0.0.0.0:8080", "Server listen/connect address")
 	lines := flag.Int("lines", 2, "Number of connection lines (Client mode only)")
-	mtu := flag.Int("mtu", 1300, "Virtual Interface MTU")
-	fragSize := flag.Int("frag", 1200, "Fragmentation size (Must be < MTU)")
+	mtu := flag.Int("mtu", 1280, "Virtual Interface MTU")
+	fragSize := flag.Int("frag", 1300, "Fragmentation size (Must be < MTU)")
 	vip := flag.String("vip", "10.0.0.1/24", "Virtual IP CIDR for TUN interface")
 	weights := flag.String("weights", "", "Comma separated weights")
 	ifaces := flag.String("ifaces", "", "Comma separated interface names to bind")
