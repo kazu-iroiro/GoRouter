@@ -3,7 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto" // crypto.SHA256等のために必要
+	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -36,7 +36,7 @@ import (
 // --- 設定・定数 ---
 
 const (
-	ProtocolVersion   = "BOND/6.2-QUIC-V0.33"
+	ProtocolVersion   = "BOND/6.3-QUIC-MODERN"
 	ChallengeSize     = 32
 	KeepAliveInterval = 10 * time.Second
 	TunReadSize       = 65535 
@@ -198,7 +198,7 @@ func main() {
 // net.Conn インターフェースを満たすためのラッパー
 type QuicStreamConn struct {
 	Stream quic.Stream
-	Conn   quic.Session // [QUIC変更] v0.33互換: Connection -> Session
+	Conn   quic.Connection // 最新版quic-goではConnection
 }
 
 func (q *QuicStreamConn) Read(b []byte) (n int, err error)  { return q.Stream.Read(b) }
@@ -243,7 +243,6 @@ func generateClientTLSConfig() *tls.Config {
 
 func runServer(iface *water.Interface, addr string, fragSize int) {
 	// QUICリスナーの開始
-	// [QUIC変更] v0.33互換: ListenAddr は (Listener, error) を返す
 	listener, err := quic.ListenAddr(addr, generateServerTLSConfig(), nil)
 	if err != nil {
 		log.Fatalf("QUIC Listen error: %v", err)
@@ -296,14 +295,13 @@ func runServer(iface *water.Interface, addr string, fragSize int) {
 
 	for {
 		// QUIC接続待機
-		// [QUIC変更] v0.33互換: Accept returns (Session, error)
 		conn, err := listener.Accept(context.Background())
 		if err != nil {
 			log.Printf("Accept error: %v", err)
 			continue
 		}
 
-		go func(qConn quic.Session) { // [QUIC変更] Connection -> Session
+		go func(qConn quic.Connection) { // 最新版: Connection
 			// ストリームの待機 (1接続につき1ストリームを使用)
 			stream, err := qConn.AcceptStream(context.Background())
 			if err != nil {
@@ -409,26 +407,22 @@ func runClient(iface *water.Interface, serverAddr string, numLines int, fragSize
 		}
 
 		// UDPConnを指定してQUIC接続
-		var qConn quic.Session // [QUIC変更] Connection -> Session
+		var qConn quic.Connection // 最新版: Connection
 		var err error
 		
-		// [QUIC変更] v0.33互換: Contextは使用しない(DialAddr), Dialの引数調整
-		// quic.DialはPacketConnを受け取る
-		
-		// サーバーのホスト名またはIP（SNI用）
-		serverHost, _, _ := net.SplitHostPort(serverAddr)
+		// タイムアウト付きコンテキスト
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 
 		if udpConn != nil {
-			// バインドあり: Dial(PacketConn, RemoteAddr, SNI_Host, ...)
+			// バインドあり: Dial(ctx, PacketConn, RemoteAddr, tlsConf, config)
 			rAddr, err := net.ResolveUDPAddr("udp", serverAddr)
 			if err == nil {
-				// [QUIC変更] v0.33 Dial signature: (pconn, remoteAddr, host, tlsConf, config)
-				qConn, err = quic.Dial(udpConn, rAddr, serverHost, generateClientTLSConfig(), nil)
+				qConn, err = quic.Dial(ctx, udpConn, rAddr, generateClientTLSConfig(), nil)
 			}
 		} else {
-			// バインドなし (デフォルト): DialAddr(addr, tlsConf, config)
-			// [QUIC変更] v0.33 DialAddr signature: (addr, tlsConf, config) -> No Context!
-			qConn, err = quic.DialAddr(serverAddr, generateClientTLSConfig(), nil)
+			// バインドなし (デフォルト): DialAddr(ctx, addr, tlsConf, config)
+			qConn, err = quic.DialAddr(ctx, serverAddr, generateClientTLSConfig(), nil)
 		}
 
 		if err != nil {
@@ -437,7 +431,6 @@ func runClient(iface *water.Interface, serverAddr string, numLines int, fragSize
 		}
 
 		// ストリームを開く
-		// [QUIC変更] v0.33: OpenStreamSync takes context
 		stream, err := qConn.OpenStreamSync(context.Background())
 		if err != nil {
 			log.Printf("[Line %d] OpenStream Failed: %v", i, err)
