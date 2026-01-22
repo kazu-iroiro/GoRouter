@@ -3,7 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto" // 追加: crypto.SHA256等のために必要
+	"crypto" // crypto.SHA256等のために必要
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -647,7 +647,7 @@ func setupTUN(cidr string, mtu int) (*water.Interface, error) {
 // パケット処理ロジック
 // ==========================================
 
-// [追加] ConnectionWrapperの定義 (不足していた部分)
+// ConnectionWrapperの定義
 type ConnectionWrapper struct {
 	ID         int
 	Conn       net.Conn
