@@ -610,7 +610,7 @@ func runServer(iface *water.Interface, addr string, fragSize int) {
 	if err != nil { log.Fatalf("Listen error: %v", err) }
 	log.Printf("[Server] Listening on %s", addr)
 
-	packetIngress := make(chan Packet, 1000)
+	packetIngress := make(chan Packet, 10000)
 	var clients []*ConnectionWrapper
 	var clientsMu sync.Mutex
 
