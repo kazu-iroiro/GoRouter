@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto" // 追加: crypto.SHA256等のために必要
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -35,7 +36,7 @@ import (
 // --- 設定・定数 ---
 
 const (
-	ProtocolVersion   = "BOND/6.0-QUIC"
+	ProtocolVersion   = "BOND/6.1-QUIC-FIXED"
 	ChallengeSize     = 32
 	KeepAliveInterval = 10 * time.Second
 	TunReadSize       = 65535 
@@ -640,6 +641,21 @@ func setupTUN(cidr string, mtu int) (*water.Interface, error) {
 	}
 
 	return iface, nil
+}
+
+// ==========================================
+// パケット処理ロジック
+// ==========================================
+
+// [追加] ConnectionWrapperの定義 (不足していた部分)
+type ConnectionWrapper struct {
+	ID         int
+	Conn       net.Conn
+	Enc        *gob.Encoder
+	Mu         sync.Mutex
+	Alive      bool
+	RTT        time.Duration
+	BaseWeight int
 }
 
 // TUN -> Network
