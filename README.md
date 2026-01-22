@@ -4,6 +4,9 @@
 ```bash
 go mod init bonding
 go get github.com/songgao/water
+go get github.com/quic-go/quic-go
+
+go mod tidy
 
 go build -o bonding main.go
 
